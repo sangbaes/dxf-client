@@ -8,7 +8,6 @@ from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
@@ -246,7 +245,8 @@ st.caption(f"DXF_SHARED_FOLDER_ID = {DXF_SHARED_FOLDER_ID}")
 # Sidebar controls
 st.sidebar.header("옵션")
 auto_refresh = st.sidebar.checkbox("상태 자동 새로고침", value=True)
-refresh_sec = st.sidebar.slider("새로고침 주기(초)", 3, 30, 5)
+refresh_sec = st.sidebar.slider("새로고침 주기(초)", 1, 30, 3)
+fast_refresh = st.sidebar.checkbox("작업 중 빠른 새로고침(2초)", value=True)
 
 st.sidebar.divider()
 st.sidebar.caption("폴더")
@@ -334,17 +334,15 @@ else:
     st.info("META 폴더에 작업이 아직 없습니다. 먼저 업로드하세요.")
 
 # Auto refresh
-def do_autorefresh():
+def do_autorefresh(seconds: int):
     # streamlit has st_autorefresh in many versions
     try:
         from streamlit import st_autorefresh
-        st_autorefresh(interval=refresh_sec * 1000, key="job_poll")
+        st_autorefresh(interval=int(seconds) * 1000, key="job_poll")
     except Exception:
         # fallback: user can press button
         pass
 
-if auto_refresh:
-    do_autorefresh()
 
 col_a, col_b = st.columns([1, 1])
 with col_a:
@@ -360,6 +358,16 @@ if job_id:
     except Exception as e:
         st.error("META 읽기 실패")
         st.exception(e)
+
+    # Auto-refresh logic (poll META more frequently while queued/working)
+    if auto_refresh:
+        status = (meta or {}).get("status")
+        # stop polling when done/error to reduce Drive API calls
+        if status in ("done", "error"):
+            pass
+        else:
+            effective_sec = 2 if (fast_refresh and status in ("queued", "working")) else int(refresh_sec)
+            do_autorefresh(effective_sec)
 
     if meta:
         st.write(f"**status:** `{meta.get('status')}`")
