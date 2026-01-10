@@ -207,20 +207,22 @@ def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
 
 
 def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
-    q = f"'{meta_folder_id}' in parents and trashed = false"
+    q = f"'{meta_folder_id}' in parents and trashed=false"
     req = drive.files().list(
         q=q,
         fields="files(id,name,createdTime,modifiedTime,size)",
         orderBy="modifiedTime desc",
-        pageSize=limit
+        pageSize=limit,
     )
+
     try:
         res = drive_execute(req, retries=5)
     except Exception as e:
         # Drive API가 일시적으로 흔들릴 때 앱이 죽지 않게 방어
-        st.warning(f"Google Drive 조회가 일시적으로 실패했습니다. 잠시 후 자동으로 다시 시도합니다.
-
-원인: {type(e).__name__}")
+        st.warning(
+            "Google Drive 조회가 일시적으로 실패했습니다. 잠시 후 자동으로 다시 시도합니다.\n"
+            f"원인: {type(e).__name__}"
+        )
         return []
 
     files = res.get("files", [])
