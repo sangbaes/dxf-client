@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 import uuid
@@ -40,17 +41,18 @@ def make_job_id(original_name: str) -> str:
 
 
 def load_service_account_info():
-    """
-    Supports two secret formats:
-    1) st.secrets["gcp_service_account"] as dict (TOML section)
-    2) st.secrets["SERVICE_ACCOUNT_JSON"] as JSON string
-    """
-    if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-        # Defensive newline repair
-        if "private_key" in info and isinstance(info["private_key"], str):
-            info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
-        return info
+    # ✅ Base64 방식 (Streamlit Secrets: SERVICE_ACCOUNT_B64)
+    if "SERVICE_ACCOUNT_B64" not in st.secrets:
+        raise RuntimeError("Streamlit Secrets에 SERVICE_ACCOUNT_B64가 없습니다.")
+
+    raw = base64.b64decode(st.secrets["SERVICE_ACCOUNT_B64"].encode("ascii"))
+    info = json.loads(raw.decode("utf-8"))
+
+    # 방어: 혹시 \\n로 저장된 경우 실제 줄바꿈으로 복구
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
+
+    return info
 
     if "SERVICE_ACCOUNT_JSON" in st.secrets:
         info = json.loads(st.secrets["SERVICE_ACCOUNT_JSON"])
