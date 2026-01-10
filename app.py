@@ -255,6 +255,22 @@ def find_file_in_folder_by_name(drive, folder_id: str, filename: str):
 # UI
 # =========================
 st.set_page_config(page_title="DXF Client", layout="centered")
+
+# Google Analytics
+st.components.v1.html(
+    """
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-E1LFDTNPVP"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-E1LFDTNPVP');
+    </script>
+    """,
+    height=0,
+)
+
 st.title("DXF Client")
 
 with st.expander("설명", expanded=False):
