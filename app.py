@@ -2,6 +2,8 @@ import base64
 import json
 import time
 import uuid
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -64,11 +66,21 @@ def load_service_account_info():
         "Streamlit Secrets에 gcp_service_account 또는 SERVICE_ACCOUNT_JSON이 없습니다."
     )
 
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
-    info = load_service_account_info()
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    s = st.secrets["drive_oauth"]
+    creds = Credentials(
+        token=None,
+        refresh_token=s["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=s["client_id"],
+        client_secret=s["client_secret"],
+        scopes=SCOPES,
+    )
+    # access_token이 필요할 때 자동 갱신
+    creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
 
