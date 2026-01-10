@@ -10,6 +10,11 @@ from datetime import datetime, timezone, timedelta
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+import socket
+import ssl
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
+from googleapiclient.errors import HttpError
 
 
 # =========================
@@ -39,6 +44,22 @@ def make_job_id(original_name: str) -> str:
     safe = "".join(c for c in original_name if c.isalnum() or c in ("-", "_", "."))
     safe = safe[:40] if safe else "file"
     return f"{ts}_{short}_{safe}"
+
+
+
+def drive_execute(req, retries: int = 5, base_sleep: float = 0.6):
+    """Drive API 요청을 네트워크 흔들림에도 최대한 견디도록 재시도 실행."""
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            # googleapiclient 자체 재시도도 있지만, SSL read/connection reset은 직접 감싸주는 게 더 안정적임
+            return req.execute(num_retries=1)
+        except (HttpError, OSError, ssl.SSLError, socket.timeout) as e:
+            last_err = e
+            if i >= retries:
+                raise
+            time.sleep(base_sleep * (2 ** i))
+    raise last_err
 
 
 def load_service_account_info():
@@ -80,7 +101,12 @@ def get_drive_service():
     )
     # access_token이 필요할 때 자동 갱신
     creds.refresh(Request())
-    return build("drive", "v3", credentials=creds)
+
+    # Streamlit Cloud에서 간헐적으로 발생하는 SSL/네트워크 read 문제를 완화하기 위해
+    # - httplib2 timeout 지정
+    # - AuthorizedHttp 사용
+    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
+    return build("drive", "v3", http=authed_http, cache_discovery=False)
 
 
 def find_or_create_folder(drive, parent_id: str, name: str) -> str:
@@ -90,7 +116,7 @@ def find_or_create_folder(drive, parent_id: str, name: str) -> str:
         "mimeType = 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = drive.files().list(q=q, fields="files(id,name)").execute()
+    res = drive.files().list(q=q, fields="files(id,name)").execute(num_retries=3)
     files = res.get("files", [])
     if files:
         return files[0]["id"]
@@ -182,15 +208,23 @@ def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
 
 def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
     q = f"'{meta_folder_id}' in parents and trashed = false"
-    res = drive.files().list(
+    req = drive.files().list(
         q=q,
         fields="files(id,name,createdTime,modifiedTime,size)",
         orderBy="modifiedTime desc",
         pageSize=limit
-    ).execute()
+    )
+    try:
+        res = drive_execute(req, retries=5)
+    except Exception as e:
+        # Drive API가 일시적으로 흔들릴 때 앱이 죽지 않게 방어
+        st.warning(f"Google Drive 조회가 일시적으로 실패했습니다. 잠시 후 자동으로 다시 시도합니다.
+
+원인: {type(e).__name__}")
+        return []
+
     files = res.get("files", [])
-    # only json
-    files = [f for f in files if f["name"].lower().endswith(".json")]
+    files = [f for f in files if f.get("name", "").lower().endswith(".json")]
     return files
 
 
@@ -245,8 +279,7 @@ st.caption(f"DXF_SHARED_FOLDER_ID = {DXF_SHARED_FOLDER_ID}")
 # Sidebar controls
 st.sidebar.header("옵션")
 auto_refresh = st.sidebar.checkbox("상태 자동 새로고침", value=True)
-refresh_sec = st.sidebar.slider("새로고침 주기(초)", 1, 30, 3)
-fast_refresh = st.sidebar.checkbox("작업 중 빠른 새로고침(2초)", value=True)
+refresh_sec = st.sidebar.slider("새로고침 주기(초)", 3, 30, 5)
 
 st.sidebar.divider()
 st.sidebar.caption("폴더")
@@ -334,15 +367,17 @@ else:
     st.info("META 폴더에 작업이 아직 없습니다. 먼저 업로드하세요.")
 
 # Auto refresh
-def do_autorefresh(seconds: int):
+def do_autorefresh():
     # streamlit has st_autorefresh in many versions
     try:
         from streamlit import st_autorefresh
-        st_autorefresh(interval=int(seconds) * 1000, key="job_poll")
+        st_autorefresh(interval=refresh_sec * 1000, key="job_poll")
     except Exception:
         # fallback: user can press button
         pass
 
+if auto_refresh:
+    do_autorefresh()
 
 col_a, col_b = st.columns([1, 1])
 with col_a:
@@ -358,16 +393,6 @@ if job_id:
     except Exception as e:
         st.error("META 읽기 실패")
         st.exception(e)
-
-    # Auto-refresh logic (poll META more frequently while queued/working)
-    if auto_refresh:
-        status = (meta or {}).get("status")
-        # stop polling when done/error to reduce Drive API calls
-        if status in ("done", "error"):
-            pass
-        else:
-            effective_sec = 2 if (fast_refresh and status in ("queued", "working")) else int(refresh_sec)
-            do_autorefresh(effective_sec)
 
     if meta:
         st.write(f"**status:** `{meta.get('status')}`")
