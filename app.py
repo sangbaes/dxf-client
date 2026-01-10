@@ -1,35 +1,57 @@
 import streamlit as st
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-st.set_page_config(
-    page_title="DXF Client",
-    layout="centered"
+st.set_page_config(page_title="DXF Client – Drive Test")
+st.title("DXF Client – Google Drive Connection Test")
+
+# 1. Secrets 로드
+try:
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    st.success("✅ Service Account credentials loaded")
+except Exception as e:
+    st.error("❌ Failed to load service account credentials")
+    st.exception(e)
+    st.stop()
+
+# 2. Drive API 연결
+try:
+    drive = build("drive", "v3", credentials=creds)
+    st.success("✅ Google Drive API connected")
+except Exception as e:
+    st.error("❌ Failed to connect to Google Drive API")
+    st.exception(e)
+    st.stop()
+
+# 3. DXF_SHARED 폴더 검색
+st.subheader("Searching for DXF_SHARED folder...")
+
+query = (
+    "name = 'DXF_SHARED' and "
+    "mimeType = 'application/vnd.google-apps.folder' and "
+    "trashed = false"
 )
 
-st.title("DXF Translation Client")
+try:
+    res = drive.files().list(
+        q=query,
+        fields="files(id, name)"
+    ).execute()
 
-st.info(
-    """
-    이 앱은 DXF 파일 업로드 후
-    로컬 번역 워커(MacBook Pro)에서 처리하고
-    완료되면 다운로드를 제공하는 클라이언트입니다.
+    folders = res.get("files", [])
 
-    현재는 초기 설정 단계입니다.
-    """
-)
+    if not folders:
+        st.error("❌ DXF_SHARED folder not found")
+        st.info("👉 Drive에 폴더가 존재하고 서비스 계정에 공유되었는지 확인하세요.")
+    else:
+        folder = folders[0]
+        st.success("✅ DXF_SHARED folder found")
+        st.code(f"Folder name: {folder['name']}\nFolder ID: {folder['id']}")
+        st.info("👉 이 Folder ID를 다음 단계에서 고정값으로 사용합니다.")
 
-st.subheader("Status")
-st.write("🟡 준비 중 (Drive 연동 예정)")
-
-st.divider()
-
-st.subheader("Next steps")
-st.markdown(
-    """
-    - Google Drive 연동
-    - DXF 파일 업로드
-    - 작업 상태 확인
-    - 번역 완료 파일 다운로드
-    """
-)
-
-st.caption("DXF Client · Streamlit Cloud")
+except Exception as e:
+    st.error("❌ Error while searching for folder")
+    st.exception(e)
