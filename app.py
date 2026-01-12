@@ -132,7 +132,7 @@ def get_drive():
 def upload_file_to_folder(drive, folder_id: str, filename: str, file_bytes: bytes, mime: str):
     media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime, resumable=False)
     body = {"name": filename, "parents": [folder_id]}
-    return execute_with_retries(drive.files().create(body=body, media_body=media, fields=\"id,name\", supportsAllDrives=True))
+    return execute_with_retries(drive.files().create(body=body, media_body=media, fields="id,name", supportsAllDrives=True))
 
 def download_file_bytes(drive, file_id: str) -> bytes:
     request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -150,17 +150,17 @@ def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
         "mimeType != 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = execute_with_retries(drive.files().list(q=q, fields=\"files(id,name)\", supportsAllDrives=True, includeItemsFromAllDrives=True))
+    res = execute_with_retries(drive.files().list(q=q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True))
     files = res.get("files", [])
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
 
     if files:
         file_id = files[0]["id"]
-        return execute_with_retries(drive.files().update(fileId=file_id, media_body=media, fields=\"id,name\", supportsAllDrives=True))
+        return execute_with_retries(drive.files().update(fileId=file_id, media_body=media, fields="id,name", supportsAllDrives=True))
     else:
         body = {"name": filename, "parents": [folder_id]}
-        return execute_with_retries(drive.files().create(body=body, media_body=media, fields=\"id,name\", supportsAllDrives=True))
+        return execute_with_retries(drive.files().create(body=body, media_body=media, fields="id,name", supportsAllDrives=True))
 
 def find_file_by_name(drive, folder_id: str, filename: str) -> Optional[dict]:
     q = (
@@ -169,7 +169,7 @@ def find_file_by_name(drive, folder_id: str, filename: str) -> Optional[dict]:
         "mimeType != 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = execute_with_retries(drive.files().list(q=q, fields=\"files(id,name,modifiedTime,size)\", supportsAllDrives=True, includeItemsFromAllDrives=True))
+    res = execute_with_retries(drive.files().list(q=q, fields="files(id,name,modifiedTime,size)", supportsAllDrives=True, includeItemsFromAllDrives=True))
     files = res.get("files", [])
     return files[0] if files else None
 
@@ -180,7 +180,7 @@ def list_manifest_files(drive, folder_id: str, limit: int = 50) -> List[dict]:
         "name contains '__manifest.json' and "
         "trashed = false"
     )
-    res = execute_with_retries(drive.files().list(q=q, pageSize=min(limit, 100), fields=\"files(id,name,modifiedTime),nextPageToken\", orderBy=\"modifiedTime desc\", supportsAllDrives=True, includeItemsFromAllDrives=True))
+    res = execute_with_retries(drive.files().list(q=q, pageSize=min(limit, 100), fields="files(id,name,modifiedTime),nextPageToken", orderBy="modifiedTime desc", supportsAllDrives=True, includeItemsFromAllDrives=True))
     return res.get("files", [])
 
 def read_json_file_by_id(drive, file_id: str) -> dict:
