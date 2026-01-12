@@ -1,317 +1,515 @@
+import base64
 import json
-from io import BytesIO
-from collections import Counter
-
-import streamlit as st
+import time
+import uuid
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from io import BytesIO
+from datetime import datetime, timezone, timedelta
+
+import streamlit as st
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+import socket
+import ssl
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
+from googleapiclient.errors import HttpError
 
 
-# ✅ 당신 폴더 ID
-META_FOLDER_ID = "1x2YCQTPOd5KC4tZdwfmX8zf7NZNO6Y_w"
-DONE_FOLDER_ID = "1rC_1x1HAoJZ65YuGLDw8GikyBbqXWIJa"
-META_ARCHIVE_FOLDER_ID = "1wo3yA5OpEeDIdPgRdQbznbZ9LUUNoNtK"
+# =========================
+# Config
+# =========================
+DXF_SHARED_FOLDER_ID = "1qhx_xTGdOusxhV0xN2df4Kc8JTfh3zTd"
+
+SUBFOLDERS = ["INBOX", "WORKING", "DONE", "META"]
+MAX_FILE_MB = 200
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+
+SEOUL_TZ = timezone(timedelta(hours=9))
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
-@st.cache_resource(show_spinner=False)
-def drive():
-    cfg = st.secrets.get("drive_oauth") or st.secrets.get("DRIVE_OAUTH")
-    if not cfg:
-        st.error('Streamlit Secrets에 [drive_oauth]가 없습니다. Settings → Secrets에 OAuth 정보를 추가하세요.')
-        st.stop()
+# =========================
+# Helpers
+# =========================
+def now_seoul_iso() -> str:
+    return datetime.now(SEOUL_TZ).isoformat(timespec="seconds")
 
+
+def _clean_json_text(s: str) -> str:
+    # Remove BOM, null bytes, and trim whitespace
+    if not s:
+        return ""
+    return s.lstrip("\ufeff").replace("\x00", "").strip()
+
+
+def _extract_json_payload(s: str) -> str:
+    """Extract the most likely JSON object/array payload from a messy string."""
+    s = _clean_json_text(s)
+    if not s:
+        return ""
+    # Prefer object
+    i = s.find("{")
+    j = s.rfind("}")
+    if 0 <= i < j:
+        return s[i : j + 1]
+    # Or array
+    i = s.find("[")
+    j = s.rfind("]")
+    if 0 <= i < j:
+        return s[i : j + 1]
+    return s
+
+
+def safe_json_loads(raw: str) -> dict | list | None:
+    """Best-effort JSON parse. Returns None if parse fails."""
+    try:
+        payload = _extract_json_payload(raw)
+        if not payload:
+            return None
+        return json.loads(payload)
+    except Exception:
+        return None
+
+
+def make_job_id(original_name: str) -> str:
+    ts = datetime.now(SEOUL_TZ).strftime("%Y%m%d_%H%M%S")
+    short = uuid.uuid4().hex[:8]
+    safe = "".join(c for c in original_name if c.isalnum() or c in ("-", "_", "."))
+    safe = safe[:40] if safe else "file"
+    return f"{ts}_{short}_{safe}"
+
+
+
+def drive_execute(req, retries: int = 5, base_sleep: float = 0.6):
+    """Drive API 요청을 네트워크 흔들림에도 최대한 견디도록 재시도 실행."""
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            # googleapiclient 자체 재시도도 있지만, SSL read/connection reset은 직접 감싸주는 게 더 안정적임
+            return req.execute(num_retries=1)
+        except (HttpError, OSError, ssl.SSLError, socket.timeout) as e:
+            last_err = e
+            if i >= retries:
+                raise
+            time.sleep(base_sleep * (2 ** i))
+    raise last_err
+
+
+def load_service_account_info():
+    # ✅ Base64 방식 (Streamlit Secrets: SERVICE_ACCOUNT_B64)
+    if "SERVICE_ACCOUNT_B64" not in st.secrets:
+        raise RuntimeError("Streamlit Secrets에 SERVICE_ACCOUNT_B64가 없습니다.")
+
+    raw = base64.b64decode(st.secrets["SERVICE_ACCOUNT_B64"].encode("ascii"))
+    info = json.loads(raw.decode("utf-8"))
+
+    # 방어: 혹시 \\n로 저장된 경우 실제 줄바꿈으로 복구
+    if "private_key" in info and isinstance(info["private_key"], str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
+
+    return info
+
+    if "SERVICE_ACCOUNT_JSON" in st.secrets:
+        info = json.loads(st.secrets["SERVICE_ACCOUNT_JSON"])
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
+        return info
+
+    raise RuntimeError(
+        "Streamlit Secrets에 gcp_service_account 또는 SERVICE_ACCOUNT_JSON이 없습니다."
+    )
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+@st.cache_resource(show_spinner=False)
+def get_drive_service():
+    s = st.secrets["drive_oauth"]
     creds = Credentials(
         token=None,
-        refresh_token=cfg["refresh_token"],
+        refresh_token=s["refresh_token"],
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=cfg["client_id"],
-        client_secret=cfg["client_secret"],
+        client_id=s["client_id"],
+        client_secret=s["client_secret"],
         scopes=SCOPES,
     )
+    # access_token이 필요할 때 자동 갱신
     creds.refresh(Request())
-    return build("drive", "v3", credentials=creds)
+
+    # Streamlit Cloud에서 간헐적으로 발생하는 SSL/네트워크 read 문제를 완화하기 위해
+    # - httplib2 timeout 지정
+    # - AuthorizedHttp 사용
+    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
+    return build("drive", "v3", http=authed_http, cache_discovery=False)
 
 
-def list_meta_files(limit=200):
-    svc = drive()
-    q = f"'{META_FOLDER_ID}' in parents and trashed=false"
-    res = svc.files().list(
+def find_or_create_folder(drive, parent_id: str, name: str) -> str:
+    q = (
+        f"'{parent_id}' in parents and "
+        f"name = '{name}' and "
+        "mimeType = 'application/vnd.google-apps.folder' and "
+        "trashed = false"
+    )
+    res = drive.files().list(q=q, fields="files(id,name)").execute(num_retries=3)
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = drive.files().create(body=metadata, fields="id").execute()
+    return folder["id"]
+
+
+def get_subfolder_ids(drive):
+    # cache in session to avoid repeated API calls
+    if "subfolder_ids" in st.session_state:
+        return st.session_state["subfolder_ids"]
+
+    ids = {}
+    for name in SUBFOLDERS:
+        ids[name] = find_or_create_folder(drive, DXF_SHARED_FOLDER_ID, name)
+
+    st.session_state["subfolder_ids"] = ids
+    return ids
+
+
+def upload_file_to_folder(drive, folder_id: str, filename: str, file_bytes: bytes, mime: str):
+    media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime, resumable=True)
+    metadata = {"name": filename, "parents": [folder_id]}
+    req = drive.files().create(body=metadata, media_body=media, fields="id,name,size,createdTime")
+    resp = None
+
+    # Resumable upload loop
+    while resp is None:
+        status, resp = req.next_chunk()
+        if status:
+            st.session_state["upload_progress"] = int(status.progress() * 100)
+
+    return resp
+
+
+def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
+    # Find existing
+    q = (
+        f"'{folder_id}' in parents and "
+        f"name = '{filename}' and "
+        "mimeType != 'application/vnd.google-apps.folder' and "
+        "trashed = false"
+    )
+    res = drive.files().list(q=q, fields="files(id,name)").execute()
+    files = res.get("files", [])
+
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
+
+    if files:
+        file_id = files[0]["id"]
+        updated = drive.files().update(fileId=file_id, media_body=media).execute()
+        return updated
+    else:
+        meta = {"name": filename, "parents": [folder_id]}
+        created = drive.files().create(body=meta, media_body=media, fields="id").execute()
+        return created
+
+
+def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
+    """Read a JSON file from Drive by name.
+
+    Important: meta JSON can be temporarily empty or partially written while the worker updates it.
+    This function is defensive: it retries briefly and returns None instead of crashing the app.
+    """
+    q = (
+        f"'{folder_id}' in parents and "
+        f"name = '{filename}' and "
+        "trashed = false"
+    )
+
+    # Find the file id (use drive_execute for resilience)
+    try:
+        res = drive_execute(drive.files().list(q=q, fields="files(id,name,size,modifiedTime)"), retries=5)
+    except Exception:
+        res = drive.files().list(q=q, fields="files(id,name,size,modifiedTime)").execute()
+
+    files = res.get("files", [])
+    if not files:
+        return None
+
+    file_id = files[0]["id"]
+
+    last_err = None
+    for _ in range(3):
+        try:
+            request = drive.files().get_media(fileId=file_id)
+            buf = BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            raw = buf.getvalue().decode("utf-8", errors="ignore")
+            parsed = safe_json_loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            # if empty/invalid, retry shortly (likely being written)
+            time.sleep(0.6)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.6)
+
+    return None
+
+
+
+def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
+    q = f"'{meta_folder_id}' in parents and trashed=false"
+    req = drive.files().list(
         q=q,
-        fields="files(id,name,modifiedTime,createdTime,size)",
+        fields="files(id,name,createdTime,modifiedTime,size)",
         orderBy="modifiedTime desc",
-        pageSize=limit
-    ).execute()
-    files = [f for f in res.get("files", []) if f["name"].lower().endswith(".json")]
+        pageSize=limit,
+    )
+
+    try:
+        res = drive_execute(req, retries=5)
+    except Exception as e:
+        # Drive API가 일시적으로 흔들릴 때 앱이 죽지 않게 방어
+        st.warning(
+            "Google Drive 조회가 일시적으로 실패했습니다. 잠시 후 자동으로 다시 시도합니다.\n"
+            f"원인: {type(e).__name__}"
+        )
+        return []
+
+    files = res.get("files", [])
+    files = [f for f in files if f.get("name", "").lower().endswith(".json")]
     return files
 
 
-def download_json(file_id: str) -> dict:
-    svc = drive()
-    req = svc.files().get_media(fileId=file_id)
+def download_file_bytes(drive, file_id: str) -> bytes:
+    request = drive.files().get_media(fileId=file_id)
     buf = BytesIO()
-    dl = MediaIoBaseDownload(buf, req)
+    downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
-        _, done = dl.next_chunk()
-    raw = buf.getvalue().decode("utf-8", errors="replace")
-    # 비표준 NULL 방어(혹시 남아있으면)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        fixed = raw.replace(":NULL", ":null").replace(": NULL", ": null")
-        return json.loads(fixed)
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
 
 
-def update_json(file_id: str, payload: dict):
-    svc = drive()
-    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
-    svc.files().update(fileId=file_id, media_body=media).execute()
-
-
-def find_done_file(name: str):
-    svc = drive()
-    q = f"'{DONE_FOLDER_ID}' in parents and name='{name}' and trashed=false"
-    res = svc.files().list(q=q, fields="files(id,name,size,modifiedTime)").execute()
+def find_file_in_folder_by_name(drive, folder_id: str, filename: str):
+    q = (
+        f"'{folder_id}' in parents and "
+        f"name = '{filename}' and "
+        "trashed = false"
+    )
+    res = drive.files().list(q=q, fields="files(id,name,size,modifiedTime)").execute()
     files = res.get("files", [])
     return files[0] if files else None
 
 
-def move_file(file_id: str, from_folder_id: str, to_folder_id: str):
-    svc = drive()
-    svc.files().update(
-        fileId=file_id,
-        addParents=to_folder_id,
-        removeParents=from_folder_id,
-        fields="id, parents",
-    ).execute()
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="DXF Client", layout="centered")
 
+# Google Analytics
+st.components.v1.html(
+    """
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-E1LFDTNPVP"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-E1LFDTNPVP');
+    </script>
+    """,
+    height=0,
+)
 
-def download_file_bytes(file_id: str) -> bytes:
-    svc = drive()
-    req = svc.files().get_media(fileId=file_id)
-    buf = BytesIO()
-    dl = MediaIoBaseDownload(buf, req)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    return buf.getvalue()
+st.title("DXF Client")
 
+with st.expander("설명", expanded=False):
+    st.markdown(
+        """
+- 이 앱은 **Google Drive 공유폴더에 DXF를 업로드**하고,
+- MacBook Pro 로컬 워커가 번역 후 결과를 `DONE/`에 올리면,
+- 앱이 완료를 감지해 **다운로드 버튼**을 제공합니다.
+        """
+    )
 
-st.set_page_config(page_title="DXF Monitor", layout="wide")
-st.title("DXF Monitor")
+# Drive connection
+try:
+    drive = get_drive_service()
+    folders = get_subfolder_ids(drive)
+except Exception as e:
+    st.error("Google Drive 연결/폴더 초기화에 실패했습니다. Secrets 또는 폴더 공유 권한을 확인하세요.")
+    st.exception(e)
+    st.stop()
 
-# -----------------------
-# Sidebar: auto refresh
-# -----------------------
-auto = st.sidebar.checkbox("자동 새로고침", True)
-sec = st.sidebar.slider("주기(초)", 3, 30, 5)
+st.success("✅ Google Drive 연결됨")
+st.caption(f"DXF_SHARED_FOLDER_ID = {DXF_SHARED_FOLDER_ID}")
 
-if auto:
+# Sidebar controls
+st.sidebar.header("옵션")
+auto_refresh = st.sidebar.checkbox("상태 자동 새로고침", value=True)
+refresh_sec = st.sidebar.slider("새로고침 주기(초)", 3, 30, 5)
+
+st.sidebar.divider()
+st.sidebar.caption("폴더")
+for k in SUBFOLDERS:
+    st.sidebar.write(f"- {k}: `{folders[k]}`")
+
+# Upload section
+st.subheader("1) DXF 업로드")
+uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False)
+
+if uploaded is not None:
+    size = uploaded.size  # bytes
+    st.write(f"파일명: `{uploaded.name}` / 크기: {size/1024/1024:.1f} MB")
+
+    if size > MAX_FILE_BYTES:
+        st.error(f"파일이 너무 큽니다. {MAX_FILE_MB}MB 이하만 업로드할 수 있습니다.")
+    else:
+        if st.button("INBOX로 업로드", type="primary"):
+            st.session_state.pop("upload_progress", None)
+            file_bytes = uploaded.getvalue()
+
+            job_id = make_job_id(uploaded.name)
+            inbox_name = f"{job_id}__{uploaded.name}"
+
+            meta_filename = f"{job_id}.json"
+            meta_payload = {
+                "job_id": job_id,
+                "original_name": uploaded.name,
+                "inbox_name": inbox_name,
+                "status": "queued",  # queued | working | done | error
+                "created_at": now_seoul_iso(),
+                "updated_at": now_seoul_iso(),
+                "progress": 0,
+                "message": "Uploaded to INBOX. Waiting for local worker.",
+                "done_file": None,
+                "error": None,
+            }
+
+            with st.spinner("업로드 중..."):
+                try:
+                    resp = upload_file_to_folder(
+                        drive,
+                        folders["INBOX"],
+                        inbox_name,
+                        file_bytes,
+                        mime="application/dxf"
+                    )
+                    meta_payload["inbox_file_id"] = resp.get("id")
+                    meta_payload["progress"] = 5
+                    meta_payload["updated_at"] = now_seoul_iso()
+
+                    upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
+
+                    st.success("✅ 업로드 완료")
+                    st.code(f"job_id: {job_id}")
+                    st.session_state["active_job_id"] = job_id
+
+                except Exception as e:
+                    st.error("❌ 업로드 실패")
+                    st.exception(e)
+
+# Progress indicator (upload)
+if "upload_progress" in st.session_state:
+    st.progress(st.session_state["upload_progress"] / 100.0)
+
+st.divider()
+
+# Job monitor
+st.subheader("2) 작업 상태 / 다운로드")
+
+# Load recent jobs for selection
+recent = list_recent_jobs(drive, folders["META"], limit=30)
+recent_ids = [f["name"].replace(".json", "") for f in recent]
+
+default_job = st.session_state.get("active_job_id")
+if default_job and default_job in recent_ids:
+    default_index = recent_ids.index(default_job)
+else:
+    default_index = 0 if recent_ids else None
+
+job_id = None
+if recent_ids:
+    job_id = st.selectbox("최근 작업 선택", recent_ids, index=default_index)
+else:
+    st.info("META 폴더에 작업이 아직 없습니다. 먼저 업로드하세요.")
+
+# Auto refresh
+def do_autorefresh():
+    # streamlit has st_autorefresh in many versions
     try:
         from streamlit import st_autorefresh
-        st_autorefresh(interval=sec * 1000, key="mon_auto")
+        st_autorefresh(interval=refresh_sec * 1000, key="job_poll")
     except Exception:
+        # fallback: user can press button
         pass
 
-st.sidebar.caption("Folders")
-st.sidebar.write(f"- META: `{META_FOLDER_ID}`")
-st.sidebar.write(f"- DONE: `{DONE_FOLDER_ID}`")
-st.sidebar.write(f"- META_ARCHIVE: `{META_ARCHIVE_FOLDER_ID}`")
+if auto_refresh:
+    do_autorefresh()
 
-# -----------------------
-# Sidebar: META reset (ARCHIVE)
-# -----------------------
-st.sidebar.divider()
-st.sidebar.subheader("관리")
-reset_scope = st.sidebar.selectbox("리셋 대상", ["active만(queued/working/error)", "전체(done 포함)"])
-confirm = st.sidebar.text_input('확인 문구 입력: RESET', value="")
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    manual_refresh = st.button("상태 새로고침")
+with col_b:
+    st.caption("자동 새로고침이 안 되면 버튼을 사용하세요.")
 
-if st.sidebar.button("META 리셋 (ARCHIVE로 이동)", type="primary", disabled=(confirm != "RESET")):
-    # META 파일을 넉넉하게 가져옴
-    meta_files = list_meta_files(limit=2000)
-    moved = 0
+if job_id:
+    meta_name = f"{job_id}.json"
+    meta = None
+    try:
+        meta = read_json_file_by_name(drive, folders["META"], meta_name)
+    except Exception as e:
+        st.error("META 읽기 실패")
+        st.exception(e)
 
-    for f in meta_files:
-        meta = download_json(f["id"])
-        status = meta.get("status")
-
-        if reset_scope.startswith("active") and status == "done":
-            continue
-
-        move_file(f["id"], META_FOLDER_ID, META_ARCHIVE_FOLDER_ID)
-        moved += 1
-
-    st.sidebar.success(f"완료: {moved}개 META를 ARCHIVE로 이동했습니다.")
-    st.rerun()
-
-# -----------------------
-# Main: list jobs
-# -----------------------
-files = list_meta_files(limit=200)
-
-rows = []
-cache = {}  # job_id -> (meta_file_id, meta)
-
-# 너무 많으면 느릴 수 있어 최근 80개만 우선
-for f in files[:80]:
-    meta = download_json(f["id"])
-    job_id = meta.get("job_id") or f["name"].replace(".json", "")
-    cache[job_id] = (f["id"], meta)
-    rows.append({
-        "job_id": job_id,
-        "status": meta.get("status"),
-        "progress": int(meta.get("progress") or 0),
-        "updated_at": meta.get("updated_at"),
-        "original_name": meta.get("original_name"),
-        "message": meta.get("message"),
-    })
-
-cnt = Counter([r["status"] for r in rows])
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("queued", cnt.get("queued", 0))
-c2.metric("working", cnt.get("working", 0))
-c3.metric("done", cnt.get("done", 0))
-c4.metric("error", cnt.get("error", 0))
-
-st.divider()
-st.subheader("Jobs (최근 80개)")
-st.dataframe(rows, width="stretch", hide_index=True)
-
-st.subheader("Job detail")
-job_ids = [r["job_id"] for r in rows]
-selected = st.selectbox("job_id 선택", job_ids) if job_ids else None
-
-if selected:
-    meta_file_id, meta = cache[selected]
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        st.write("### Status")
+    if meta:
         st.write(f"**status:** `{meta.get('status')}`")
-        st.write(f"**progress:** `{meta.get('progress')}`")
         st.write(f"**updated_at:** `{meta.get('updated_at')}`")
         st.write(f"**message:** {meta.get('message')}")
-        st.progress(min(max(int(meta.get("progress") or 0), 0), 100) / 100)
+        prog = int(meta.get("progress", 0) or 0)
+        st.progress(min(max(prog, 0), 100) / 100.0)
 
-    with colB:
-        st.write("### Logs / Error")
-        if meta.get("error"):
-            st.error("error")
-            st.code(meta.get("error"))
-        if meta.get("translator_log_tail"):
-            st.caption("translator_log_tail")
-            st.code(meta.get("translator_log_tail"))
+        if meta.get("status") == "error":
+            st.error("작업 실패")
+            if meta.get("error"):
+                st.code(meta.get("error"))
 
-    st.write("### META JSON")
-    st.json(meta)
-
-    # (선택) 에러/스턱 상황에서 재시도 버튼
-    if meta.get("status") in ("error", "working"):
-        st.caption("운영 버튼 (선택)")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("queued로 되돌리기(재시도)", type="primary"):
-                meta["status"] = "queued"
-                meta["progress"] = 0
-                meta["message"] = "Re-queued by monitor."
-                meta["error"] = None
-                meta["updated_at"] = None  # 워커가 다시 세팅
-                update_json(meta_file_id, meta)
-                st.success("queued로 되돌렸습니다. 잠시 후 워커가 다시 잡습니다.")
-                st.rerun()
-        with col2:
-            if st.button("working → error로 강제 종료 표시"):
-                meta["status"] = "error"
-                meta["progress"] = 100
-                meta["message"] = "Manually marked as error."
-                meta["error"] = meta.get("error") or "Manually marked."
-                update_json(meta_file_id, meta)
-                st.success("error로 표시했습니다.")
-                st.rerun()
-
-    # DONE 다운로드
-    if meta.get("status") == "done" and meta.get("done_file"):
-        done_obj = find_done_file(meta["done_file"])
-        if done_obj:
-            data = download_file_bytes(done_obj["id"])
-            st.download_button(
-                "DONE 결과 다운로드",
-                data=data,
-                file_name=meta["done_file"],
-                mime="application/dxf",
-                type="primary",
-            )
-        else:
-            st.warning("DONE 폴더에서 결과 파일을 아직 찾지 못했습니다.")
-
-st.divider()
-st.subheader("완료된 결과 파일 (최근 30개)")
-
-@st.cache_data(show_spinner=False, ttl=60*10)
-def _cached_download_file_bytes(file_id: str) -> bytes:
-    return download_file_bytes(file_id)
-
-done_candidates = []
-for r in rows:
-    if r.get("status") != "done":
-        continue
-    meta_file_id, meta = cache.get(r["job_id"], (None, None))
-    if not meta:
-        continue
-    done_name = meta.get("done_file")
-    if not done_name:
-        continue
-    done_obj = find_done_file(done_name)
-    if not done_obj:
-        continue
-    done_candidates.append({
-        "job_id": r["job_id"],
-        "original": meta.get("original_name") or r.get("names"),
-        "done_file": done_name,
-        "done_file_id": done_obj["id"],
-        "updated_at": meta.get("updated_at"),
-        "message": meta.get("message"),
-    })
-
-# 최신순 정렬(문자열 ISO 형식 가정)
-done_candidates.sort(key=lambda x: (x.get("updated_at") or ""), reverse=True)
-done_candidates = done_candidates[:30]
-
-if not done_candidates:
-    st.info("DONE 상태의 작업이 아직 없거나, DONE 폴더에서 결과 파일을 찾지 못했습니다.")
-else:
-    for item in done_candidates:
-        c1, c2, c3, c4 = st.columns([3, 3, 2, 2])
-        with c1:
-            st.write(f"**{item['done_file']}**")
-            if item.get("original"):
-                st.caption(f"원본: {item['original']}")
-        with c2:
-            st.write(f"`job_id`: {item['job_id']}")
-            if item.get("updated_at"):
-                st.caption(f"updated_at: {item['updated_at']}")
-            if item.get("message"):
-                st.caption(item["message"])
-        with c3:
-            # 버튼 클릭 시에만 다운로드 바이트 준비
-            if st.button("파일 준비", key=f"prep_{item['done_file_id']}"):
-                st.session_state[f"data_{item['done_file_id']}"] = _cached_download_file_bytes(item["done_file_id"])
-        with c4:
-            data_key = f"data_{item['done_file_id']}"
-            if data_key in st.session_state:
-                st.download_button(
-                    "다운로드",
-                    data=st.session_state[data_key],
-                    file_name=item["done_file"],
-                    mime="application/dxf",
-                    key=f"dl_{item['done_file_id']}",
-                    type="primary",
-                )
+        if meta.get("status") == "done":
+            done_file = meta.get("done_file")
+            if not done_file:
+                st.warning("done 상태지만 done_file 정보가 META에 없습니다.")
             else:
-                st.caption("준비 필요")
-        st.divider()
+                st.success("✅ 번역 완료")
+                st.write(f"결과 파일: `{done_file}`")
+
+                done_obj = find_file_in_folder_by_name(drive, folders["DONE"], done_file)
+                if not done_obj:
+                    st.warning("DONE 폴더에서 결과 파일을 아직 찾지 못했습니다. 잠시 후 다시 시도하세요.")
+                else:
+                    # Download through API and offer download button
+                    try:
+                        with st.spinner("결과 파일 다운로드 준비 중... (파일이 크면 시간이 걸릴 수 있습니다)"):
+                            data = download_file_bytes(drive, done_obj["id"])
+                        st.download_button(
+                            label="결과 DXF 다운로드",
+                            data=data,
+                            file_name=done_file,
+                            mime="application/dxf",
+                            type="primary",
+                        )
+                    except Exception as e:
+                        st.error("결과 파일 다운로드 준비 실패")
+                        st.exception(e)
+
+    else:
+        st.info("해당 job의 META 파일을 아직 찾지 못했습니다.")
