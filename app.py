@@ -65,18 +65,32 @@ def make_batch_id() -> str:
     return f"{ts}_{uuid.uuid4().hex[:8]}"
 
 def get_service_account_info() -> dict:
+    # 1) Streamlit 표준 방식: [gcp_service_account]
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
+        return info
+
+    # 2) 우리가 쓰던 B64/JSON 방식
     if "SERVICE_ACCOUNT_B64" in st.secrets:
         raw = base64.b64decode(st.secrets["SERVICE_ACCOUNT_B64"].encode("ascii"))
         info = json.loads(raw.decode("utf-8"))
         if "private_key" in info and isinstance(info["private_key"], str):
             info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
         return info
+
     if "SERVICE_ACCOUNT_JSON" in st.secrets:
         info = json.loads(st.secrets["SERVICE_ACCOUNT_JSON"])
         if "private_key" in info and isinstance(info["private_key"], str):
             info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
         return info
-    raise RuntimeError("Streamlit Secrets에 SERVICE_ACCOUNT_B64 또는 SERVICE_ACCOUNT_JSON이 없습니다.")
+
+    st.error("❌ Google Drive 서비스계정 Secrets가 없습니다.")
+    st.info("Streamlit Cloud → Settings → Secrets에 SERVICE_ACCOUNT_JSON 또는 [gcp_service_account]를 추가하세요.")
+    st.stop()
+
+
 
 @st.cache_resource(show_spinner=False)
 def get_drive():
