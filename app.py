@@ -332,26 +332,32 @@ for k in SUBFOLDERS:
 
 # Upload section
 st.subheader("1) DXF 업로드")
-uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False, key=f"uploader_{st.session_state.get('uploader_key', 0)}")
+uploaded_list = uploaded_list = st.file_uploader(
+    "DXF 파일 선택 (여러 개 가능)",
+    type=["dxf"],
+    accept_multiple_files=True,
+    key=f"uploader_{st.session_state.get('uploader_key', 0)}",
+)
+", type=["dxf"], accept_multiple_files=True, key=f"uploader_{st.session_state.get('uploader_key', 0)}")
 
-if uploaded is not None:
-    size = uploaded.size  # bytes
-    st.write(f"파일명: `{uploaded.name}` / 크기: {size/1024/1024:.1f} MB")
+if uploaded_list is not None:
+    size = uploaded_list.size  # bytes
+    st.write(f"파일명: `{uploaded_list.name}` / 크기: {size/1024/1024:.1f} MB")
 
     if size > MAX_FILE_BYTES:
         st.error(f"파일이 너무 큽니다. {MAX_FILE_MB}MB 이하만 업로드할 수 있습니다.")
     else:
         if st.button("INBOX로 업로드", type="primary"):
             st.session_state.pop("upload_progress", None)
-            file_bytes = uploaded.getvalue()
+            file_bytes = uploaded_list.getvalue()
 
-            job_id = make_job_id(uploaded.name)
-            inbox_name = f"{job_id}__{uploaded.name}"
+            job_id = make_job_id(uploaded_list.name)
+            inbox_name = f"{job_id}__{uploaded_list.name}"
 
             meta_filename = f"{job_id}.json"
             meta_payload = {
                 "job_id": job_id,
-                "original_name": uploaded.name,
+                "original_name": uploaded_list.name,
                 "inbox_name": inbox_name,
                 "status": "queued",  # queued | working | done | error
                 "created_at": now_seoul_iso(),
