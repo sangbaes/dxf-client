@@ -2,6 +2,7 @@ import base64
 import json
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -306,153 +307,67 @@ for k in SUBFOLDERS:
     st.sidebar.write(f"- {k}: `{folders[k]}`")
 
 # Upload section
-st.subheader("1) DXF 업로드 (Batch)")
-uploaded_list = st.file_uploader(
-    "DXF 파일 선택 (여러 개 가능)",
-    type=["dxf"],
-    accept_multiple_files=True
-)
+st.subheader("1) DXF 업로드")
+uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False)
 
-def _make_batch_id() -> str:
-    # stable, time-sortable prefix + short uuid
-    # example: 20260112_173210_ab12cd34
-    ts = now_seoul_iso().replace(":", "").replace("-", "").replace("+0900", "").replace("T", "_")
-    # ts like 20260112_173210.123+09:00 depending on your formatter; keep it simple:
-    ts = ts.split(".")[0].replace("+09:00", "").replace("+0900", "")
-    return f"{ts}_{uuid.uuid4().hex[:8]}"
+if uploaded is not None:
+    size = uploaded.size  # bytes
+    st.write(f"파일명: `{uploaded.name}` / 크기: {size/1024/1024:.1f} MB")
 
-def _safe_name(name: str) -> str:
-    # Prevent weird path-ish names
-    return Path(name).name
-
-if uploaded_list:
-    total_files = len(uploaded_list)
-    total_size = sum(u.size for u in uploaded_list)
-
-    st.write(f"선택된 파일: **{total_files}개** / 총 크기: **{total_size/1024/1024:.1f} MB**")
-    too_big = [u for u in uploaded_list if u.size > MAX_FILE_BYTES]
-
-    if too_big:
-        st.error(
-            "아래 파일이 너무 큽니다. "
-            f"{MAX_FILE_MB}MB 이하만 업로드할 수 있습니다:\n- "
-            + "\n- ".join([f"{u.name} ({u.size/1024/1024:.1f}MB)" for u in too_big])
-        )
+    if size > MAX_FILE_BYTES:
+        st.error(f"파일이 너무 큽니다. {MAX_FILE_MB}MB 이하만 업로드할 수 있습니다.")
     else:
-        # Batch upload button
-        if st.button("INBOX로 일괄 업로드", type="primary"):
+        if st.button("INBOX로 업로드", type="primary"):
             st.session_state.pop("upload_progress", None)
+            file_bytes = uploaded.getvalue()
 
-            batch_id = _make_batch_id()
-            created_at = now_seoul_iso()
+            job_id = make_job_id(uploaded.name)
+            inbox_name = f"{job_id}__{uploaded.name}"
 
-            manifest_filename = f"{batch_id}__manifest.json"
-            manifest_payload = {
-                "batch_id": batch_id,
-                "status": "uploading",  # uploading | queued | done | error
-                "created_at": created_at,
-                "updated_at": created_at,
-                "total": total_files,
-                "items": [],  # filled below
-                "message": "Uploading files to INBOX and writing META items."
+            meta_filename = f"{job_id}.json"
+            meta_payload = {
+                "job_id": job_id,
+                "original_name": uploaded.name,
+                "inbox_name": inbox_name,
+                "status": "queued",  # queued | working | done | error
+                "created_at": now_seoul_iso(),
+                "updated_at": now_seoul_iso(),
+                "progress": 0,
+                "message": "Uploaded to INBOX. Waiting for local worker.",
+                "done_file": None,
+                "error": None,
             }
 
-            progress = st.progress(0)
-            status_box = st.empty()
-
-            ok_count = 0
-            errors = []
-
             with st.spinner("업로드 중..."):
-                for idx, uploaded in enumerate(uploaded_list, 1):
-                    try:
-                        safe_orig = _safe_name(uploaded.name)
-                        file_bytes = uploaded.getvalue()
+                try:
+                    resp = upload_file_to_folder(
+                        drive,
+                        folders["INBOX"],
+                        inbox_name,
+                        file_bytes,
+                        mime="application/dxf"
+                    )
+                    meta_payload["inbox_file_id"] = resp.get("id")
+                    meta_payload["progress"] = 5
+                    meta_payload["updated_at"] = now_seoul_iso()
 
-                        # Keep current behavior: job_id derived from filename (unique enough in practice)
-                        # BUT add batch_id to correlate items.
-                        job_id = make_job_id(safe_orig)
+                    upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
 
-                        inbox_name = f"{job_id}__{safe_orig}"
-                        meta_filename = f"{job_id}.json"
+                    st.success("✅ 업로드 완료")
+                    st.code(f"job_id: {job_id}")
+                    st.session_state["active_job_id"] = job_id
 
-                        meta_payload = {
-                            "batch_id": batch_id,           # NEW (safe)
-                            "job_id": job_id,
-                            "original_name": safe_orig,
-                            "inbox_name": inbox_name,
-                            "status": "queued",             # queued | working | done | error
-                            "created_at": created_at,
-                            "updated_at": now_seoul_iso(),
-                            "progress": 0,
-                            "message": "Uploaded to INBOX. Waiting for local worker.",
-                            "done_file": None,
-                            "error": None,
-                        }
+                except Exception as e:
+                    st.error("❌ 업로드 실패")
+                    st.exception(e)
 
-                        # 1) Upload DXF to INBOX
-                        resp = upload_file_to_folder(
-                            drive,
-                            folders["INBOX"],
-                            inbox_name,
-                            file_bytes,
-                            mime="application/dxf"
-                        )
-                        meta_payload["inbox_file_id"] = resp.get("id")
-                        meta_payload["progress"] = 5
-                        meta_payload["updated_at"] = now_seoul_iso()
+# Progress indicator (upload)
+if "upload_progress" in st.session_state:
+    st.progress(st.session_state["upload_progress"] / 100.0)
 
-                        # 2) Upsert META (per-file)
-                        upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
+st.divider()
 
-                        # 3) Add to manifest
-                        manifest_payload["items"].append({
-                            "job_id": job_id,
-                            "meta_filename": meta_filename,
-                            "original_name": safe_orig,
-                            "inbox_name": inbox_name,
-                            "inbox_file_id": meta_payload.get("inbox_file_id"),
-                            "status": "queued",
-                        })
-
-                        ok_count += 1
-
-                    except Exception as e:
-                        errors.append({"file": uploaded.name, "error": str(e)})
-
-                    # UI progress update
-                    pct = int((idx / total_files) * 100)
-                    progress.progress(pct)
-                    status_box.write(f"업로드 진행: {idx}/{total_files} (성공 {ok_count} / 실패 {len(errors)})")
-
-            # Finalize manifest
-            manifest_payload["updated_at"] = now_seoul_iso()
-            if errors:
-                manifest_payload["status"] = "error"
-                manifest_payload["message"] = f"Uploaded with errors: {len(errors)} failed."
-                manifest_payload["errors"] = errors
-            else:
-                manifest_payload["status"] = "queued"
-                manifest_payload["message"] = "All files uploaded. Waiting for local worker."
-
-            # Write manifest
-            try:
-                upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
-            except Exception as e:
-                st.error("❌ manifest 저장 실패")
-                st.exception(e)
-
-            # Store batch context in session for the monitoring UI
-            st.session_state["active_batch_id"] = batch_id
-            st.session_state["active_job_ids"] = [it["job_id"] for it in manifest_payload["items"]]
-
-            if errors:
-                st.warning(f"⚠️ 일부 업로드 실패: {len(errors)}개")
-                st.json(errors)
-            st.success("✅ 배치 업로드 완료")
-            st.code(f"batch_id: {batch_id}")
-
-
+# Job monitor
 st.subheader("2) 작업 상태 / 다운로드")
 
 # Load recent jobs for selection
@@ -540,3 +455,112 @@ if job_id:
 
     else:
         st.info("해당 job의 META 파일을 아직 찾지 못했습니다.")
+
+
+# =========================
+# Batch ZIP download (multiple jobs)
+# =========================
+st.subheader("3) 배치 다운로드 (ZIP)")
+
+# 최근 META 중 manifest만 추려서 선택
+recent_json = list_recent_jobs(drive, folders["META"], limit=200)
+manifest_files = [f for f in recent_json if f.get("name", "").endswith("__manifest.json")]
+
+# 업로드 직후 세션에 batch_id가 있으면 우선 선택
+preferred_batch_id = st.session_state.get("active_batch_id")
+
+manifest_names = [f["name"] for f in manifest_files]
+default_manifest_idx = 0
+if preferred_batch_id:
+    pref_name = f"{preferred_batch_id}__manifest.json"
+    if pref_name in manifest_names:
+        default_manifest_idx = manifest_names.index(pref_name)
+
+if not manifest_files:
+    st.info("아직 배치(manifest) 작업이 없습니다. (META 폴더에 *__manifest.json* 파일이 필요합니다.)")
+else:
+    sel_name = st.selectbox(
+        "배치 작업(manifest) 선택",
+        manifest_names,
+        index=default_manifest_idx if manifest_names else 0
+    )
+
+    manifest = read_json_file_by_name(drive, folders["META"], sel_name) or {}
+    items = manifest.get("items", []) or []
+    batch_id = manifest.get("batch_id") or sel_name.replace("__manifest.json", "")
+
+    st.write(f"batch_id: `{batch_id}` / files: {len(items)}")
+
+    # 각 아이템의 최신 meta 로드 (job_id.json)
+    rows = []
+    all_terminal = True
+    any_done = False
+    done_files = []
+
+    for it in items:
+        job_id = it.get("job_id")
+        meta_name = it.get("meta_filename") or (f"{job_id}.json" if job_id else None)
+        meta = read_json_file_by_name(drive, folders["META"], meta_name) if meta_name else None
+        meta = meta or {}
+        status = meta.get("status") or it.get("status") or "unknown"
+        original = meta.get("original_name") or it.get("original_name") or ""
+        msg = meta.get("message") or ""
+        done_file = meta.get("done_file")
+
+        if status not in ("done", "error"):
+            all_terminal = False
+        if status == "done":
+            any_done = True
+            if done_file:
+                done_files.append(done_file)
+
+        rows.append({
+            "job_id": job_id,
+            "file": original,
+            "status": status,
+            "done_file": done_file or "",
+            "message": msg[:120],
+        })
+
+    # 표로 표시
+    if rows:
+        st.table(rows)
+
+    # ZIP 다운로드 버튼 (모두 terminal 상태일 때)
+    if not items:
+        st.warning("manifest에 items가 없습니다. 업로드 단계에서 manifest 작성이 실패했을 수 있습니다.")
+    elif not all_terminal:
+        st.info("아직 처리 중인 파일이 있습니다. 모든 파일이 done/error가 되면 ZIP 다운로드가 활성화됩니다.")
+    else:
+        if not any_done:
+            st.warning("완료(done)된 파일이 없습니다. (모두 error일 수 있습니다.)")
+        else:
+            # DONE 폴더에서 파일들을 내려받아 zip 생성
+            missing = []
+            zip_buf = BytesIO()
+            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for fname in done_files:
+                    obj = find_file_in_folder_by_name(drive, folders["DONE"], fname)
+                    if not obj:
+                        missing.append(fname)
+                        continue
+                    try:
+                        data = download_file_bytes(drive, obj["id"])
+                        # ZIP 안 파일명은 원본 파일명 기준으로 정리
+                        zf.writestr(Path(fname).name, data)
+                    except Exception as e:
+                        missing.append(f"{fname} ({type(e).__name__})")
+
+            if missing:
+                st.warning("일부 결과 파일을 DONE 폴더에서 찾지 못했거나 다운로드 실패했습니다:")
+                st.write(missing)
+
+            zip_buf.seek(0)
+            zip_name = f"{batch_id}_results.zip"
+            st.download_button(
+                "✅ ZIP으로 전체 다운로드",
+                data=zip_buf.getvalue(),
+                file_name=zip_name,
+                mime="application/zip",
+                type="primary",
+            )
