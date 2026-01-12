@@ -38,42 +38,6 @@ def now_seoul_iso() -> str:
     return datetime.now(SEOUL_TZ).isoformat(timespec="seconds")
 
 
-def _clean_json_text(s: str) -> str:
-    # Remove BOM, null bytes, and trim whitespace
-    if not s:
-        return ""
-    return s.lstrip("\ufeff").replace("\x00", "").strip()
-
-
-def _extract_json_payload(s: str) -> str:
-    """Extract the most likely JSON object/array payload from a messy string."""
-    s = _clean_json_text(s)
-    if not s:
-        return ""
-    # Prefer object
-    i = s.find("{")
-    j = s.rfind("}")
-    if 0 <= i < j:
-        return s[i : j + 1]
-    # Or array
-    i = s.find("[")
-    j = s.rfind("]")
-    if 0 <= i < j:
-        return s[i : j + 1]
-    return s
-
-
-def safe_json_loads(raw: str) -> dict | list | None:
-    """Best-effort JSON parse. Returns None if parse fails."""
-    try:
-        payload = _extract_json_payload(raw)
-        if not payload:
-            return None
-        return json.loads(payload)
-    except Exception:
-        return None
-
-
 def make_job_id(original_name: str) -> str:
     ts = datetime.now(SEOUL_TZ).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
@@ -219,51 +183,27 @@ def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
 
 
 def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
-    """Read a JSON file from Drive by name.
-
-    Important: meta JSON can be temporarily empty or partially written while the worker updates it.
-    This function is defensive: it retries briefly and returns None instead of crashing the app.
-    """
     q = (
         f"'{folder_id}' in parents and "
         f"name = '{filename}' and "
         "trashed = false"
     )
-
-    # Find the file id (use drive_execute for resilience)
-    try:
-        res = drive_execute(drive.files().list(q=q, fields="files(id,name,size,modifiedTime)"), retries=5)
-    except Exception:
-        res = drive.files().list(q=q, fields="files(id,name,size,modifiedTime)").execute()
-
+    res = drive.files().list(q=q, fields="files(id,name)").execute()
     files = res.get("files", [])
     if not files:
         return None
 
     file_id = files[0]["id"]
+    request = drive.files().get_media(fileId=file_id)
 
-    last_err = None
-    for _ in range(3):
-        try:
-            request = drive.files().get_media(fileId=file_id)
-            buf = BytesIO()
-            downloader = MediaIoBaseDownload(buf, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
 
-            raw = buf.getvalue().decode("utf-8", errors="ignore")
-            parsed = safe_json_loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-            # if empty/invalid, retry shortly (likely being written)
-            time.sleep(0.6)
-        except Exception as e:
-            last_err = e
-            time.sleep(0.6)
-
-    return None
-
+    buf.seek(0)
+    return json.loads(buf.read().decode("utf-8"))
 
 
 def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
@@ -315,22 +255,6 @@ def find_file_in_folder_by_name(drive, folder_id: str, filename: str):
 # UI
 # =========================
 st.set_page_config(page_title="DXF Client", layout="centered")
-
-# Google Analytics
-st.components.v1.html(
-    """
-    <!-- Google tag (gtag.js) -->
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-E1LFDTNPVP"></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag(){dataLayer.push(arguments);}
-      gtag('js', new Date());
-      gtag('config', 'G-E1LFDTNPVP');
-    </script>
-    """,
-    height=0,
-)
-
 st.title("DXF Client")
 
 with st.expander("설명", expanded=False):
