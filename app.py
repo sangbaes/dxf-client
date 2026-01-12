@@ -2,14 +2,29 @@ import base64
 import json
 import time
 import uuid
-import zipfile
-from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
+
+def reset_for_new_job():
+    """Reset session state so the client app is ready for a new batch/job."""
+    for k in [
+        "active_job_id",
+        "active_job_ids",
+        "active_batch_id",
+        "upload_progress",
+        "selected_manifest",
+        "zip_bytes",
+        "zip_name",
+    ]:
+        st.session_state.pop(k, None)
+
+    # Reset file uploader by bumping its key
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
+
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 import socket
@@ -275,6 +290,15 @@ st.components.v1.html(
 
 st.title("DXF Client")
 
+
+col_new1, col_new2 = st.columns([1, 3])
+with col_new1:
+    if st.button("🆕 새 작업 시작"):
+        reset_for_new_job()
+        st.rerun()
+with col_new2:
+    st.caption("새 작업을 시작합니다. (이전 작업 재다운로드는 모니터링 앱에서 제공 예정)")
+
 with st.expander("설명", expanded=False):
     st.markdown(
         """
@@ -308,7 +332,7 @@ for k in SUBFOLDERS:
 
 # Upload section
 st.subheader("1) DXF 업로드")
-uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False)
+uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False, key=f"uploader_{st.session_state.get('uploader_key', 0)}")
 
 if uploaded is not None:
     size = uploaded.size  # bytes
@@ -455,112 +479,3 @@ if job_id:
 
     else:
         st.info("해당 job의 META 파일을 아직 찾지 못했습니다.")
-
-
-# =========================
-# Batch ZIP download (multiple jobs)
-# =========================
-st.subheader("3) 배치 다운로드 (ZIP)")
-
-# 최근 META 중 manifest만 추려서 선택
-recent_json = list_recent_jobs(drive, folders["META"], limit=200)
-manifest_files = [f for f in recent_json if f.get("name", "").endswith("__manifest.json")]
-
-# 업로드 직후 세션에 batch_id가 있으면 우선 선택
-preferred_batch_id = st.session_state.get("active_batch_id")
-
-manifest_names = [f["name"] for f in manifest_files]
-default_manifest_idx = 0
-if preferred_batch_id:
-    pref_name = f"{preferred_batch_id}__manifest.json"
-    if pref_name in manifest_names:
-        default_manifest_idx = manifest_names.index(pref_name)
-
-if not manifest_files:
-    st.info("아직 배치(manifest) 작업이 없습니다. (META 폴더에 *__manifest.json* 파일이 필요합니다.)")
-else:
-    sel_name = st.selectbox(
-        "배치 작업(manifest) 선택",
-        manifest_names,
-        index=default_manifest_idx if manifest_names else 0
-    )
-
-    manifest = read_json_file_by_name(drive, folders["META"], sel_name) or {}
-    items = manifest.get("items", []) or []
-    batch_id = manifest.get("batch_id") or sel_name.replace("__manifest.json", "")
-
-    st.write(f"batch_id: `{batch_id}` / files: {len(items)}")
-
-    # 각 아이템의 최신 meta 로드 (job_id.json)
-    rows = []
-    all_terminal = True
-    any_done = False
-    done_files = []
-
-    for it in items:
-        job_id = it.get("job_id")
-        meta_name = it.get("meta_filename") or (f"{job_id}.json" if job_id else None)
-        meta = read_json_file_by_name(drive, folders["META"], meta_name) if meta_name else None
-        meta = meta or {}
-        status = meta.get("status") or it.get("status") or "unknown"
-        original = meta.get("original_name") or it.get("original_name") or ""
-        msg = meta.get("message") or ""
-        done_file = meta.get("done_file")
-
-        if status not in ("done", "error"):
-            all_terminal = False
-        if status == "done":
-            any_done = True
-            if done_file:
-                done_files.append(done_file)
-
-        rows.append({
-            "job_id": job_id,
-            "file": original,
-            "status": status,
-            "done_file": done_file or "",
-            "message": msg[:120],
-        })
-
-    # 표로 표시
-    if rows:
-        st.table(rows)
-
-    # ZIP 다운로드 버튼 (모두 terminal 상태일 때)
-    if not items:
-        st.warning("manifest에 items가 없습니다. 업로드 단계에서 manifest 작성이 실패했을 수 있습니다.")
-    elif not all_terminal:
-        st.info("아직 처리 중인 파일이 있습니다. 모든 파일이 done/error가 되면 ZIP 다운로드가 활성화됩니다.")
-    else:
-        if not any_done:
-            st.warning("완료(done)된 파일이 없습니다. (모두 error일 수 있습니다.)")
-        else:
-            # DONE 폴더에서 파일들을 내려받아 zip 생성
-            missing = []
-            zip_buf = BytesIO()
-            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for fname in done_files:
-                    obj = find_file_in_folder_by_name(drive, folders["DONE"], fname)
-                    if not obj:
-                        missing.append(fname)
-                        continue
-                    try:
-                        data = download_file_bytes(drive, obj["id"])
-                        # ZIP 안 파일명은 원본 파일명 기준으로 정리
-                        zf.writestr(Path(fname).name, data)
-                    except Exception as e:
-                        missing.append(f"{fname} ({type(e).__name__})")
-
-            if missing:
-                st.warning("일부 결과 파일을 DONE 폴더에서 찾지 못했거나 다운로드 실패했습니다:")
-                st.write(missing)
-
-            zip_buf.seek(0)
-            zip_name = f"{batch_id}_results.zip"
-            st.download_button(
-                "✅ ZIP으로 전체 다운로드",
-                data=zip_buf.getvalue(),
-                file_name=zip_name,
-                mime="application/zip",
-                type="primary",
-            )
