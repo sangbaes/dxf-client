@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import time
 import uuid
 import zipfile
@@ -13,7 +14,6 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google_auth_httplib2 import AuthorizedHttp
-
 
 from googleapiclient.errors import HttpError
 
@@ -370,16 +370,14 @@ if uploaded_list:
                         meta_payload["updated_at"] = now_seoul_iso()
 
                         # Write into single job_list.json (update-only)
-                    job_list_id, job_list = load_job_list(drive, folders["META"])
-                    if not job_list_id:
-                        st.error("❌ META 폴더에 job_list.json이 없습니다.")
-                        st.info(f"Drive에서 META 폴더에 '{JOB_LIST_NAME}' 파일을 (빈 JSON: {{}})로 먼저 만들어 주세요.
-"
-                                "※ 서비스계정은 My Drive에 새 파일 생성이 제한될 수 있어, 기존 파일 업데이트 방식으로 운영합니다.")
-                        st.stop()
-                    job_list["jobs"][job_id] = meta_payload
-                    save_job_list(drive, job_list_id, job_list)
-
+                        job_list_id, job_list = load_job_list(drive, folders["META"])
+                        if not job_list_id:
+                            st.error("❌ META 폴더에 job_list.json이 없습니다.")
+                            st.info(f"Drive에서 META 폴더에 '{JOB_LIST_NAME}' 파일을 (빈 JSON: {{}})로 먼저 만들어 주세요.\n"
+                                    "※ 서비스계정은 My Drive에 새 파일 생성이 제한될 수 있어, 기존 파일 업데이트 방식으로 운영합니다.")
+                            st.stop()
+                        job_list["jobs"][job_id] = meta_payload
+                        save_job_list(drive, job_list_id, job_list)
 
                         manifest_payload["items"].append({
                             "job_id": job_id,
@@ -409,14 +407,14 @@ if uploaded_list:
 
             try:
                 # Store batch manifest inside job_list.json (update-only)
-            job_list_id, job_list = load_job_list(drive, folders["META"])
-            if not job_list_id:
-                st.error("❌ META 폴더에 job_list.json이 없습니다.")
-                st.info(f"Drive에서 META 폴더에 '{JOB_LIST_NAME}' 파일을 (빈 JSON: {{}})로 먼저 만들어 주세요.")
-                st.stop()
-            batch_id = manifest_payload.get("batch_id") or manifest_payload.get("job_id") or manifest_name.replace("__manifest.json","")
-            job_list["batches"][batch_id] = manifest_payload
-            save_job_list(drive, job_list_id, job_list)
+                job_list_id, job_list = load_job_list(drive, folders["META"])
+                if not job_list_id:
+                    st.error("❌ META 폴더에 job_list.json이 없습니다.")
+                    st.info(f"Drive에서 META 폴더에 '{JOB_LIST_NAME}' 파일을 (빈 JSON: {{}})로 먼저 만들어 주세요.")
+                    st.stop()
+                batch_id = manifest_payload.get("batch_id") or manifest_payload.get("job_id") or manifest_name.replace("__manifest.json","")
+                job_list["batches"][batch_id] = manifest_payload
+                save_job_list(drive, job_list_id, job_list)
 
             except HttpError as e:
                 st.error("❌ META에 manifest 저장 실패 (Drive API)")
