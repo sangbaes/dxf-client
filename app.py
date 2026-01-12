@@ -46,6 +46,35 @@ def reset_for_new_job():
         st.session_state.pop(k, None)
     st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
 
+
+# =========================================================
+# Drive execute helpers (retry + Shared Drive safe)
+# =========================================================
+from googleapiclient.errors import HttpError
+
+def execute_with_retries(request, retries: int = 5, base_sleep: float = 1.0):
+    """Execute a googleapiclient request with exponential backoff.
+    Retries on common transient errors (429/5xx) and some 403 rate-limit cases.
+    """
+    last_err = None
+    for i in range(retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            last_err = e
+            status = getattr(e.resp, "status", None)
+            content = getattr(e, "content", b"") or b""
+            retryable = status in (429, 500, 502, 503, 504, 409)
+            if status == 403:
+                msg = content.decode("utf-8", errors="ignore")
+                if "rateLimitExceeded" in msg or "userRateLimitExceeded" in msg:
+                    retryable = True
+            if (not retryable) or (i == retries - 1):
+                raise
+            time.sleep(base_sleep * (2 ** i))
+    raise last_err
+
+
 # =========================================================
 # Helpers
 # =========================================================
@@ -103,10 +132,10 @@ def get_drive():
 def upload_file_to_folder(drive, folder_id: str, filename: str, file_bytes: bytes, mime: str):
     media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime, resumable=False)
     body = {"name": filename, "parents": [folder_id]}
-    return drive.files().create(body=body, media_body=media, fields="id,name").execute()
+    return execute_with_retries(drive.files().create(body=body, media_body=media, fields=\"id,name\", supportsAllDrives=True))
 
 def download_file_bytes(drive, file_id: str) -> bytes:
-    request = drive.files().get_media(fileId=file_id)
+    request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = BytesIO()
     downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
     done = False
@@ -121,17 +150,17 @@ def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
         "mimeType != 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = drive.files().list(q=q, fields="files(id,name)").execute()
+    res = execute_with_retries(drive.files().list(q=q, fields=\"files(id,name)\", supportsAllDrives=True, includeItemsFromAllDrives=True))
     files = res.get("files", [])
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
 
     if files:
         file_id = files[0]["id"]
-        return drive.files().update(fileId=file_id, media_body=media, fields="id,name").execute()
+        return execute_with_retries(drive.files().update(fileId=file_id, media_body=media, fields=\"id,name\", supportsAllDrives=True))
     else:
         body = {"name": filename, "parents": [folder_id]}
-        return drive.files().create(body=body, media_body=media, fields="id,name").execute()
+        return execute_with_retries(drive.files().create(body=body, media_body=media, fields=\"id,name\", supportsAllDrives=True))
 
 def find_file_by_name(drive, folder_id: str, filename: str) -> Optional[dict]:
     q = (
@@ -140,7 +169,7 @@ def find_file_by_name(drive, folder_id: str, filename: str) -> Optional[dict]:
         "mimeType != 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = drive.files().list(q=q, fields="files(id,name,modifiedTime,size)").execute()
+    res = execute_with_retries(drive.files().list(q=q, fields=\"files(id,name,modifiedTime,size)\", supportsAllDrives=True, includeItemsFromAllDrives=True))
     files = res.get("files", [])
     return files[0] if files else None
 
@@ -151,12 +180,7 @@ def list_manifest_files(drive, folder_id: str, limit: int = 50) -> List[dict]:
         "name contains '__manifest.json' and "
         "trashed = false"
     )
-    res = drive.files().list(
-        q=q,
-        pageSize=min(limit, 100),
-        fields="files(id,name,modifiedTime),nextPageToken",
-        orderBy="modifiedTime desc",
-    ).execute()
+    res = execute_with_retries(drive.files().list(q=q, pageSize=min(limit, 100), fields=\"files(id,name,modifiedTime),nextPageToken\", orderBy=\"modifiedTime desc\", supportsAllDrives=True, includeItemsFromAllDrives=True))
     return res.get("files", [])
 
 def read_json_file_by_id(drive, file_id: str) -> dict:
