@@ -14,6 +14,40 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google_auth_httplib2 import AuthorizedHttp
 
+
+from googleapiclient.errors import HttpError
+
+def _http_error_details(e: HttpError) -> str:
+    try:
+        return (getattr(e, "content", b"") or b"").decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def execute_with_retries(request, retries: int = 6, base_sleep: float = 1.0):
+    """Execute a googleapiclient request with exponential backoff.
+    Retries transient errors (429/5xx/409), some 403 rate-limit cases, and common network errors.
+    """
+    last_err = None
+    for i in range(retries):
+        try:
+            return request.execute()
+        except (BrokenPipeError, ConnectionError, TimeoutError, OSError) as e:
+            last_err = e
+            if i == retries - 1:
+                raise
+            time.sleep(base_sleep * (2 ** i))
+        except HttpError as e:
+            last_err = e
+            status = getattr(e.resp, "status", None)
+            body = _http_error_details(e)
+            retryable = status in (429, 500, 502, 503, 504, 409)
+            if status == 403 and ("rateLimitExceeded" in body or "userRateLimitExceeded" in body):
+                retryable = True
+            if (not retryable) or (i == retries - 1):
+                raise
+            time.sleep(base_sleep * (2 ** i))
+    raise last_err
+
 # =========================================================
 # Config
 # =========================================================
@@ -45,35 +79,6 @@ def reset_for_new_job():
     ]:
         st.session_state.pop(k, None)
     st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
-
-
-# =========================================================
-# Drive execute helpers (retry + Shared Drive safe)
-# =========================================================
-from googleapiclient.errors import HttpError
-
-def execute_with_retries(request, retries: int = 5, base_sleep: float = 1.0):
-    """Execute a googleapiclient request with exponential backoff.
-    Retries on common transient errors (429/5xx) and some 403 rate-limit cases.
-    """
-    last_err = None
-    for i in range(retries):
-        try:
-            return request.execute()
-        except HttpError as e:
-            last_err = e
-            status = getattr(e.resp, "status", None)
-            content = getattr(e, "content", b"") or b""
-            retryable = status in (429, 500, 502, 503, 504, 409)
-            if status == 403:
-                msg = content.decode("utf-8", errors="ignore")
-                if "rateLimitExceeded" in msg or "userRateLimitExceeded" in msg:
-                    retryable = True
-            if (not retryable) or (i == retries - 1):
-                raise
-            time.sleep(base_sleep * (2 ** i))
-    raise last_err
-
 
 # =========================================================
 # Helpers
@@ -126,13 +131,13 @@ def get_drive():
     info = get_service_account_info()
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     # httplib2 timeout 확장 (SSL read 끊김 완화)
-    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=60))
+    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=90))
     return build("drive", "v3", http=authed_http, cache_discovery=False)
 
 def upload_file_to_folder(drive, folder_id: str, filename: str, file_bytes: bytes, mime: str):
     media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime, resumable=False)
     body = {"name": filename, "parents": [folder_id]}
-    return execute_with_retries(drive.files().create(body=body, media_body=media, fields="id,name", supportsAllDrives=True))
+    return execute_with_retries(drive.files().create(body=body, media_body=media, fields=\"id,name\", supportsAllDrives=True))
 
 def download_file_bytes(drive, file_id: str) -> bytes:
     request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -150,17 +155,17 @@ def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
         "mimeType != 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = execute_with_retries(drive.files().list(q=q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True))
+    res = execute_with_retries(drive.files().list(q=q, fields=\"files(id,name)\", supportsAllDrives=True, includeItemsFromAllDrives=True))
     files = res.get("files", [])
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
 
     if files:
         file_id = files[0]["id"]
-        return execute_with_retries(drive.files().update(fileId=file_id, media_body=media, fields="id,name", supportsAllDrives=True))
+        return execute_with_retries(drive.files().update(fileId=file_id, media_body=media, fields=\"id,name\", supportsAllDrives=True))
     else:
         body = {"name": filename, "parents": [folder_id]}
-        return execute_with_retries(drive.files().create(body=body, media_body=media, fields="id,name", supportsAllDrives=True))
+        return execute_with_retries(drive.files().create(body=body, media_body=media, fields=\"id,name\", supportsAllDrives=True))
 
 def find_file_by_name(drive, folder_id: str, filename: str) -> Optional[dict]:
     q = (
@@ -169,7 +174,7 @@ def find_file_by_name(drive, folder_id: str, filename: str) -> Optional[dict]:
         "mimeType != 'application/vnd.google-apps.folder' and "
         "trashed = false"
     )
-    res = execute_with_retries(drive.files().list(q=q, fields="files(id,name,modifiedTime,size)", supportsAllDrives=True, includeItemsFromAllDrives=True))
+    res = execute_with_retries(drive.files().list(q=q, fields=\"files(id,name,modifiedTime,size)\", supportsAllDrives=True, includeItemsFromAllDrives=True))
     files = res.get("files", [])
     return files[0] if files else None
 
@@ -180,7 +185,7 @@ def list_manifest_files(drive, folder_id: str, limit: int = 50) -> List[dict]:
         "name contains '__manifest.json' and "
         "trashed = false"
     )
-    res = execute_with_retries(drive.files().list(q=q, pageSize=min(limit, 100), fields="files(id,name,modifiedTime),nextPageToken", orderBy="modifiedTime desc", supportsAllDrives=True, includeItemsFromAllDrives=True))
+    res = execute_with_retries(drive.files().list(q=q, pageSize=min(limit, 100), fields=\"files(id,name,modifiedTime),nextPageToken\", orderBy=\"modifiedTime desc\", supportsAllDrives=True, includeItemsFromAllDrives=True))
     return res.get("files", [])
 
 def read_json_file_by_id(drive, file_id: str) -> dict:
@@ -326,7 +331,13 @@ if uploaded_list:
                 manifest_payload["status"] = "queued"
                 manifest_payload["message"] = "All files uploaded. Waiting for local worker."
 
-            upsert_json_file(drive, folders["META"], manifest_name, manifest_payload)
+            try:
+                upsert_json_file(drive, folders["META"], manifest_name, manifest_payload)
+            except HttpError as e:
+                st.error("❌ META에 manifest 저장 실패 (Drive API)")
+                st.write("HTTP status:", getattr(e.resp, "status", None))
+                st.code(_http_error_details(e) or "(no error body)")
+                raise
 
             st.session_state["active_batch_id"] = batch_id
             st.session_state["active_job_ids"] = [it["job_id"] for it in manifest_payload["items"]]
