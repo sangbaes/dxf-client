@@ -305,67 +305,153 @@ for k in SUBFOLDERS:
     st.sidebar.write(f"- {k}: `{folders[k]}`")
 
 # Upload section
-st.subheader("1) DXF 업로드")
-uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False)
+st.subheader("1) DXF 업로드 (Batch)")
+uploaded_list = st.file_uploader(
+    "DXF 파일 선택 (여러 개 가능)",
+    type=["dxf"],
+    accept_multiple_files=True
+)
 
-if uploaded is not None:
-    size = uploaded.size  # bytes
-    st.write(f"파일명: `{uploaded.name}` / 크기: {size/1024/1024:.1f} MB")
+def _make_batch_id() -> str:
+    # stable, time-sortable prefix + short uuid
+    # example: 20260112_173210_ab12cd34
+    ts = now_seoul_iso().replace(":", "").replace("-", "").replace("+0900", "").replace("T", "_")
+    # ts like 20260112_173210.123+09:00 depending on your formatter; keep it simple:
+    ts = ts.split(".")[0].replace("+09:00", "").replace("+0900", "")
+    return f"{ts}_{uuid.uuid4().hex[:8]}"
 
-    if size > MAX_FILE_BYTES:
-        st.error(f"파일이 너무 큽니다. {MAX_FILE_MB}MB 이하만 업로드할 수 있습니다.")
+def _safe_name(name: str) -> str:
+    # Prevent weird path-ish names
+    return Path(name).name
+
+if uploaded_list:
+    total_files = len(uploaded_list)
+    total_size = sum(u.size for u in uploaded_list)
+
+    st.write(f"선택된 파일: **{total_files}개** / 총 크기: **{total_size/1024/1024:.1f} MB**")
+    too_big = [u for u in uploaded_list if u.size > MAX_FILE_BYTES]
+
+    if too_big:
+        st.error(
+            "아래 파일이 너무 큽니다. "
+            f"{MAX_FILE_MB}MB 이하만 업로드할 수 있습니다:\n- "
+            + "\n- ".join([f"{u.name} ({u.size/1024/1024:.1f}MB)" for u in too_big])
+        )
     else:
-        if st.button("INBOX로 업로드", type="primary"):
+        # Batch upload button
+        if st.button("INBOX로 일괄 업로드", type="primary"):
             st.session_state.pop("upload_progress", None)
-            file_bytes = uploaded.getvalue()
 
-            job_id = make_job_id(uploaded.name)
-            inbox_name = f"{job_id}__{uploaded.name}"
+            batch_id = _make_batch_id()
+            created_at = now_seoul_iso()
 
-            meta_filename = f"{job_id}.json"
-            meta_payload = {
-                "job_id": job_id,
-                "original_name": uploaded.name,
-                "inbox_name": inbox_name,
-                "status": "queued",  # queued | working | done | error
-                "created_at": now_seoul_iso(),
-                "updated_at": now_seoul_iso(),
-                "progress": 0,
-                "message": "Uploaded to INBOX. Waiting for local worker.",
-                "done_file": None,
-                "error": None,
+            manifest_filename = f"{batch_id}__manifest.json"
+            manifest_payload = {
+                "batch_id": batch_id,
+                "status": "uploading",  # uploading | queued | done | error
+                "created_at": created_at,
+                "updated_at": created_at,
+                "total": total_files,
+                "items": [],  # filled below
+                "message": "Uploading files to INBOX and writing META items."
             }
 
+            progress = st.progress(0)
+            status_box = st.empty()
+
+            ok_count = 0
+            errors = []
+
             with st.spinner("업로드 중..."):
-                try:
-                    resp = upload_file_to_folder(
-                        drive,
-                        folders["INBOX"],
-                        inbox_name,
-                        file_bytes,
-                        mime="application/dxf"
-                    )
-                    meta_payload["inbox_file_id"] = resp.get("id")
-                    meta_payload["progress"] = 5
-                    meta_payload["updated_at"] = now_seoul_iso()
+                for idx, uploaded in enumerate(uploaded_list, 1):
+                    try:
+                        safe_orig = _safe_name(uploaded.name)
+                        file_bytes = uploaded.getvalue()
 
-                    upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
+                        # Keep current behavior: job_id derived from filename (unique enough in practice)
+                        # BUT add batch_id to correlate items.
+                        job_id = make_job_id(safe_orig)
 
-                    st.success("✅ 업로드 완료")
-                    st.code(f"job_id: {job_id}")
-                    st.session_state["active_job_id"] = job_id
+                        inbox_name = f"{job_id}__{safe_orig}"
+                        meta_filename = f"{job_id}.json"
 
-                except Exception as e:
-                    st.error("❌ 업로드 실패")
-                    st.exception(e)
+                        meta_payload = {
+                            "batch_id": batch_id,           # NEW (safe)
+                            "job_id": job_id,
+                            "original_name": safe_orig,
+                            "inbox_name": inbox_name,
+                            "status": "queued",             # queued | working | done | error
+                            "created_at": created_at,
+                            "updated_at": now_seoul_iso(),
+                            "progress": 0,
+                            "message": "Uploaded to INBOX. Waiting for local worker.",
+                            "done_file": None,
+                            "error": None,
+                        }
 
-# Progress indicator (upload)
-if "upload_progress" in st.session_state:
-    st.progress(st.session_state["upload_progress"] / 100.0)
+                        # 1) Upload DXF to INBOX
+                        resp = upload_file_to_folder(
+                            drive,
+                            folders["INBOX"],
+                            inbox_name,
+                            file_bytes,
+                            mime="application/dxf"
+                        )
+                        meta_payload["inbox_file_id"] = resp.get("id")
+                        meta_payload["progress"] = 5
+                        meta_payload["updated_at"] = now_seoul_iso()
 
-st.divider()
+                        # 2) Upsert META (per-file)
+                        upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
 
-# Job monitor
+                        # 3) Add to manifest
+                        manifest_payload["items"].append({
+                            "job_id": job_id,
+                            "meta_filename": meta_filename,
+                            "original_name": safe_orig,
+                            "inbox_name": inbox_name,
+                            "inbox_file_id": meta_payload.get("inbox_file_id"),
+                            "status": "queued",
+                        })
+
+                        ok_count += 1
+
+                    except Exception as e:
+                        errors.append({"file": uploaded.name, "error": str(e)})
+
+                    # UI progress update
+                    pct = int((idx / total_files) * 100)
+                    progress.progress(pct)
+                    status_box.write(f"업로드 진행: {idx}/{total_files} (성공 {ok_count} / 실패 {len(errors)})")
+
+            # Finalize manifest
+            manifest_payload["updated_at"] = now_seoul_iso()
+            if errors:
+                manifest_payload["status"] = "error"
+                manifest_payload["message"] = f"Uploaded with errors: {len(errors)} failed."
+                manifest_payload["errors"] = errors
+            else:
+                manifest_payload["status"] = "queued"
+                manifest_payload["message"] = "All files uploaded. Waiting for local worker."
+
+            # Write manifest
+            try:
+                upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
+            except Exception as e:
+                st.error("❌ manifest 저장 실패")
+                st.exception(e)
+
+            # Store batch context in session for the monitoring UI
+            st.session_state["active_batch_id"] = batch_id
+            st.session_state["active_job_ids"] = [it["job_id"] for it in manifest_payload["items"]]
+
+            if errors:
+                st.warning(f"⚠️ 일부 업로드 실패: {len(errors)}개")
+                st.json(errors)
+            st.success("✅ 배치 업로드 완료")
+            st.code(f"batch_id: {batch_id}")
+
+
 st.subheader("2) 작업 상태 / 다운로드")
 
 # Load recent jobs for selection
