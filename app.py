@@ -61,6 +61,11 @@ INBOX_FOLDER_ID = st.secrets.get("INBOX_FOLDER_ID", "1QFhwS0aMPbwjtpC0k83ZJr8-ab
 DONE_FOLDER_ID  = st.secrets.get("DONE_FOLDER_ID",  "1rC_1x1HAoJZ65YuGLDw8GikyBbqXWIJa")
 META_FOLDER_ID  = st.secrets.get("META_FOLDER_ID",  "1x2YCQTPOd5KC4tZdwfmX8zf7NZNO6Y_w")
 
+# === Job list (single meta file) ===
+# Service Accounts cannot create new files in My Drive due to storage quota (403 storageQuotaExceeded).
+# Workaround: keep ONE pre-created JSON file (owned by a user) and only UPDATE it.
+JOB_LIST_NAME = os.environ.get("JOB_LIST_NAME", "job_list.json")
+
 SUBFOLDERS = {"INBOX": INBOX_FOLDER_ID, "DONE": DONE_FOLDER_ID, "META": META_FOLDER_ID}
 
 # =========================================================
@@ -234,6 +239,67 @@ uploaded_list = st.file_uploader(
     key=f"uploader_{st.session_state.get('uploader_key', 0)}",
 )
 
+
+
+def get_file_by_name_in_folder(drive, folder_id: str, name: str):
+    q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
+    res = execute_with_retries(
+        drive.files().list(
+            q=q,
+            fields="files(id,name,modifiedTime,size)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+    )
+    files = res.get("files", [])
+    return files[0] if files else None
+
+def read_json_file_by_id(drive, file_id: str) -> dict:
+    raw = download_file_bytes(drive, file_id)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+def update_json_file_by_id(drive, file_id: str, payload: dict):
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="application/json", resumable=False)
+    return execute_with_retries(
+        drive.files().update(
+            fileId=file_id,
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        )
+    )
+
+def load_job_list(drive, meta_folder_id: str):
+    f = get_file_by_name_in_folder(drive, meta_folder_id, JOB_LIST_NAME)
+    if not f:
+        return None, None
+    payload = read_json_file_by_id(drive, f["id"])
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("jobs", {})
+    payload.setdefault("batches", {})
+    return f["id"], payload
+
+def save_job_list(drive, job_list_file_id: str, payload: dict):
+    return update_json_file_by_id(drive, job_list_file_id, payload)
+
+def get_batch_manifest(drive, meta_folder_id: str, manifest_file_id: str):
+    if isinstance(manifest_file_id, str) and manifest_file_id.startswith("JOBLIST::"):
+        batch_id = manifest_file_id.split("::", 1)[1]
+        job_list_id, job_list = load_job_list(drive, meta_folder_id)
+        if job_list_id and job_list:
+            return job_list.get("batches", {}).get(batch_id, {})
+        return {}
+    return read_json_file_by_id(drive, manifest_file_id)
+
+
+
 if uploaded_list:
     total_files = len(uploaded_list)
     total_size = sum(u.size for u in uploaded_list)
@@ -303,7 +369,17 @@ if uploaded_list:
                         meta_payload["progress"] = 5
                         meta_payload["updated_at"] = now_seoul_iso()
 
-                        upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
+                        # Write into single job_list.json (update-only)
+                    job_list_id, job_list = load_job_list(drive, folders["META"])
+                    if not job_list_id:
+                        st.error("❌ META 폴더에 job_list.json이 없습니다.")
+                        st.info(f"Drive에서 META 폴더에 '{JOB_LIST_NAME}' 파일을 (빈 JSON: {{}})로 먼저 만들어 주세요.
+"
+                                "※ 서비스계정은 My Drive에 새 파일 생성이 제한될 수 있어, 기존 파일 업데이트 방식으로 운영합니다.")
+                        st.stop()
+                    job_list["jobs"][job_id] = meta_payload
+                    save_job_list(drive, job_list_id, job_list)
+
 
                         manifest_payload["items"].append({
                             "job_id": job_id,
@@ -332,7 +408,16 @@ if uploaded_list:
                 manifest_payload["message"] = "All files uploaded. Waiting for local worker."
 
             try:
-                upsert_json_file(drive, folders["META"], manifest_name, manifest_payload)
+                # Store batch manifest inside job_list.json (update-only)
+            job_list_id, job_list = load_job_list(drive, folders["META"])
+            if not job_list_id:
+                st.error("❌ META 폴더에 job_list.json이 없습니다.")
+                st.info(f"Drive에서 META 폴더에 '{JOB_LIST_NAME}' 파일을 (빈 JSON: {{}})로 먼저 만들어 주세요.")
+                st.stop()
+            batch_id = manifest_payload.get("batch_id") or manifest_payload.get("job_id") or manifest_name.replace("__manifest.json","")
+            job_list["batches"][batch_id] = manifest_payload
+            save_job_list(drive, job_list_id, job_list)
+
             except HttpError as e:
                 st.error("❌ META에 manifest 저장 실패 (Drive API)")
                 st.write("HTTP status:", getattr(e.resp, "status", None))
