@@ -471,17 +471,60 @@ st.sidebar.subheader("Worker status")
 active_workers, last_seen = list_worker_heartbeats(drive, folders["META"], ttl_sec=HEARTBEAT_TIMEOUT)
 
 # --- Debug/Status variables (used by Developer Debug Panel) ---
-worker_heartbeat_raw = active_workers[0] if active_workers else {}
-heartbeat_ts = (last_seen.isoformat(timespec="seconds") if last_seen is not None else None)
-now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+# --- Worker heartbeat 읽기 (worker_id 기반 직접 접근) ---
+worker_heartbeat_raw = None
+heartbeat_ts = None
 diff_sec = None
 is_worker_alive = False
-if last_seen is not None:
+now_iso = None
+HEARTBEAT_TIMEOUT = 30  # seconds
+
+from datetime import datetime, timezone
+
+def _parse_iso(dt_str: str):
+    if not dt_str:
+        return None
     try:
-        diff_sec = (datetime.now(timezone.utc) - last_seen.astimezone(timezone.utc)).total_seconds()
-        is_worker_alive = diff_sec <= HEARTBEAT_TIMEOUT
+        return datetime.fromisoformat(dt_str)
     except Exception:
-        pass
+        return None
+
+try:
+    now = datetime.now(timezone.utc).astimezone()  # 로컬(+09:00)로 변환됨
+    now_iso = now.isoformat(timespec="seconds")
+
+    # ✅ 1) job_meta에 worker_id가 있으면 그걸로 heartbeat 파일명 직접 생성
+    wid = None
+    try:
+        wid = (job_meta or {}).get("worker_id")
+    except Exception:
+        wid = None
+
+    if wid:
+        # 워커가 저장하는 heartbeat 파일명이 이런 형태인 경우가 가장 흔함
+        candidate_names = [
+            f"__worker__{wid}.json",
+            f"{wid}.json",
+            f"worker_heartbeat__{wid}.json",
+        ]
+
+        for name in candidate_names:
+            try:
+                tmp = read_json_file_by_name(drive, folders["META"], name)
+                if tmp:
+                    worker_heartbeat_raw = tmp
+                    break
+            except Exception:
+                pass
+
+    # ✅ 2) heartbeat_ts / alive 계산
+    heartbeat_ts = _parse_iso((worker_heartbeat_raw or {}).get("updated_at"))
+    if heartbeat_ts:
+        diff_sec = (now - heartbeat_ts).total_seconds()
+        is_worker_alive = diff_sec <= HEARTBEAT_TIMEOUT
+
+except Exception:
+    pass
 
 if not active_workers:
     st.sidebar.markdown("🔴 **작업워커 없음**")
