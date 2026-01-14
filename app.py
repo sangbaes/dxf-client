@@ -393,9 +393,9 @@ def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30):
 #     for f in files:
 #         try:
 #             meta = download_json(drive, f["id"])
-#             if meta.get("type") != "worker_heartbeat":
+#             if job_meta.get("type") != "worker_heartbeat":
 #                 continue
-#             updated_at = meta.get("updated_at")
+#             updated_at = job_meta.get("updated_at")
 #             if not updated_at:
 #                 continue
 #             # Python 3.9: fromisoformat handles '+09:00' offsets
@@ -459,9 +459,26 @@ st.sidebar.header("Options")
 auto_refresh = st.sidebar.checkbox("Auto-refresh status", value=True)
 refresh_sec = st.sidebar.slider("Refresh interval (sec)", 3, 30, 5)
 
+
+# Worker heartbeat timeout (sec)
+HEARTBEAT_TIMEOUT = 30  # worker is considered alive if heartbeat within this window
+
 st.sidebar.divider()
 st.sidebar.subheader("Worker status")
-active_workers, last_seen = list_worker_heartbeats(drive, folders["META"], ttl_sec=30)
+active_workers, last_seen = list_worker_heartbeats(drive, folders["META"], ttl_sec=HEARTBEAT_TIMEOUT)
+
+# --- Debug/Status variables (used by Developer Debug Panel) ---
+worker_heartbeat_raw = active_workers[0] if active_workers else {}
+heartbeat_ts = (last_seen.isoformat(timespec="seconds") if last_seen is not None else None)
+now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+diff_sec = None
+is_worker_alive = False
+if last_seen is not None:
+    try:
+        diff_sec = (datetime.now(timezone.utc) - last_seen.astimezone(timezone.utc)).total_seconds()
+        is_worker_alive = diff_sec <= HEARTBEAT_TIMEOUT
+    except Exception:
+        pass
 
 if not active_workers:
     st.sidebar.markdown("🔴 **작업워커 없음**")
@@ -660,28 +677,28 @@ with col_b:
     st.caption("Use button if auto-refresh doesn't work")
 
 if job_id:
-    meta_name = f"{job_id}.json"
+    job_meta_name = f"{job_id}.json"
     try:
-        meta = read_json_file_by_name(drive, folders["META"], meta_name)
+        job_meta = read_json_file_by_name(drive, folders["META"], job_meta_name)
     except Exception as e:
         st.error(f"Failed to read META\n\n{type(e).__name__}: {e}")
-        meta = None
+        job_meta = None
 
 
-    if meta:
-        st.write(f"**status:** `{meta.get('status')}`")
-        st.write(f"**updated_at:** `{meta.get('updated_at')}`")
-        st.write(f"**message:** {meta.get('message')}")
-        prog = int(meta.get("progress", 0) or 0)
+    if job_meta:
+        st.write(f"**status:** `{job_meta.get('status')}`")
+        st.write(f"**updated_at:** `{job_meta.get('updated_at')}`")
+        st.write(f"**message:** {job_meta.get('message')}")
+        prog = int(job_meta.get("progress", 0) or 0)
         st.progress(min(max(prog, 0), 100) / 100.0)
 
-        if meta.get("status") == "error":
+        if job_meta.get("status") == "error":
             st.error("Job failed")
-            if meta.get("error"):
-                st.code(meta.get("error"))
+            if job_meta.get("error"):
+                st.code(job_meta.get("error"))
 
-        if meta.get("status") == "done":
-            done_file = meta.get("done_file")
+        if job_meta.get("status") == "done":
+            done_file = job_meta.get("done_file")
             if not done_file:
                 st.warning("Status is 'done' but done_file is missing in META")
             else:
@@ -709,47 +726,3 @@ if job_id:
 
     else:
         st.info("META file not found for this job yet")
-
-# ==================================================
-# 🔧 Developer Debug Panel (DEV ONLY)
-# ==================================================
-
-DEV_MODE = True  # 배포 시 False / env / secrets 로 제어 추천
-
-def _g(name, default="(undefined)"):
-    """safe get from globals without NameError"""
-    return globals().get(name, default)
-
-if DEV_MODE:
-    st.markdown("---")
-    with st.expander("🔧 Developer Debug Panel", expanded=False):
-
-        # 1) Worker heartbeat raw
-        st.subheader("🫀 Worker Heartbeat Raw")
-        hb_raw = _g("worker_heartbeat_raw", None)
-        st.json(hb_raw or {})
-
-        # 2) Worker alive 판단 로직
-        st.subheader("🚦 Worker Alive Check")
-        st.write({
-            "now_iso": _g("now_iso"),
-            "heartbeat_ts": _g("heartbeat_ts"),
-            "diff_sec": _g("diff_sec"),
-            "alive_threshold_sec": _g("HEARTBEAT_TIMEOUT"),
-            "is_worker_alive": _g("is_worker_alive"),
-        })
-
-        # 3) Job meta raw
-        st.subheader("📦 Job Meta Raw")
-        m = _g("meta", None)
-        st.json(m or {})
-
-        # 4) Refresh 상태 (네 코드 기준 변수/세션 둘 다 보여주기)
-        st.subheader("🔄 Refresh Info")
-        st.write({
-            "auto_refresh(var)": _g("auto_refresh"),
-            "refresh_sec(var)": _g("refresh_sec"),
-            "manual_refresh_clicked": _g("manual_refresh"),
-            "session_state.auto_refresh": st.session_state.get("auto_refresh", "(missing)"),
-            "session_state.refresh_interval": st.session_state.get("refresh_interval", "(missing)"),
-        })
