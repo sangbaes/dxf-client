@@ -56,7 +56,7 @@ def _with_retry(fn, *, tries: int = 5, base_sleep: float = 0.6, max_sleep: float
     for attempt in range(1, tries + 1):
         try:
             return fn()
-        except Exception as e:
+            except Exception as e:
             last = e
             if not _is_transient_exc(e) or attempt == tries:
                 raise
@@ -263,7 +263,7 @@ def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
 
     try:
         res = drive_execute(req, retries=5)
-    except Exception as e:
+        except Exception as e:
         st.warning(
             f"Google Drive query temporarily failed. Will retry automatically.\n"
             f"Reason: {type(e).__name__}"
@@ -389,28 +389,29 @@ def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30):
     return active, last_seen
 
 
-    active = []
-    for f in files:
-        try:
-            meta = download_json(drive, f["id"])
-            if meta.get("type") != "worker_heartbeat":
-                continue
-            updated_at = meta.get("updated_at")
-            if not updated_at:
-                continue
-            # Python 3.9: fromisoformat handles '+09:00' offsets
-            dt = _dt.datetime.fromisoformat(updated_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            age = (now - dt.astimezone(_dt.timezone.utc)).total_seconds()
-            if age <= ttl_sec:
-                active.append((age, meta))
-        except Exception:
-            continue
+#     active = []
+#     for f in files:
+#         try:
+#             meta = download_json(drive, f["id"])
+#             if meta.get("type") != "worker_heartbeat":
+#                 continue
+#             updated_at = meta.get("updated_at")
+#             if not updated_at:
+#                 continue
+#             # Python 3.9: fromisoformat handles '+09:00' offsets
+#             dt = _dt.datetime.fromisoformat(updated_at)
+#             if dt.tzinfo is None:
+#                 dt = dt.replace(tzinfo=_dt.timezone.utc)
+#             age = (now - dt.astimezone(_dt.timezone.utc)).total_seconds()
+#             if age <= ttl_sec:
+#                 active.append((age, meta))
+#         except Exception:
+#             continue
 
-    # sort by worker_id for stable ordering (not by age)
-    active.sort(key=lambda x: (x[1].get("worker_id") or "", x[0]))
-    return [m for _, m in active]
+#     # sort by worker_id for stable ordering (not by age)
+#     active.sort(key=lambda x: (x[1].get("worker_id") or "", x[0]))
+#     return [m for _, m in active]
+
 
 # UI
 # =========================
@@ -446,8 +447,8 @@ with st.expander("About", expanded=False):
 try:
     drive = get_drive_service()
     folders = get_subfolder_ids(drive)
-except Exception as e:
-            st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
+    except Exception as e:
+    st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
     st.exception(e)
     st.stop()
 
@@ -581,7 +582,7 @@ if uploaded_list:
 
                         ok_count += 1
 
-                        except Exception as e:
+                    except Exception as e:
                         errors.append({"file": uploaded.name, "error": str(e)})
 
                     # UI progress update
@@ -602,8 +603,8 @@ if uploaded_list:
             # Write manifest
             try:
                 upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
-            except Exception as e:
-                        st.error("❌ Failed to save manifest")
+                except Exception as e:
+                st.error("❌ Failed to save manifest")
                 st.exception(e)
 
             # Store batch context
@@ -654,26 +655,22 @@ with col_b:
 
 if job_id:
     meta_name = f"{job_id}.json"
-
     try:
         meta = read_json_file_by_name(drive, folders["META"], meta_name)
     except Exception as e:
-        st.error("Failed to read META")
-        st.exception(e)
+        st.error(f"Failed to read META\n\n{type(e).__name__}: {e}")
         meta = None
 
-    if not meta:
-        st.info("META file not found for this job yet")
-    else:
+    if meta:
+    if meta:
         st.write(f"**status:** `{meta.get('status')}`")
         st.write(f"**updated_at:** `{meta.get('updated_at')}`")
         st.write(f"**message:** {meta.get('message')}")
-
         prog = int(meta.get("progress", 0) or 0)
         st.progress(min(max(prog, 0), 100) / 100.0)
 
         if meta.get("status") == "error":
-            st.error("Job failed")
+                    st.error("Job failed")
             if meta.get("error"):
                 st.code(meta.get("error"))
 
@@ -685,20 +682,13 @@ if job_id:
                 st.success("✅ Translation completed")
                 st.write(f"Result file: `{done_file}`")
 
-                done_obj = find_file_in_folder_by_name(
-                    drive, folders["DONE"], done_file
-                )
+                done_obj = find_file_in_folder_by_name(drive, folders["DONE"], done_file)
                 if not done_obj:
-                    st.warning(
-                        "Result file not found in DONE folder yet. Please try again later."
-                    )
+                    st.warning("Result file not found in DONE folder yet. Please try again later.")
                 else:
                     try:
-                        with st.spinner(
-                            "Preparing download... (may take time for large files)"
-                        ):
+                        with st.spinner("Preparing download... (may take time for large files)"):
                             data = download_file_bytes(drive, done_obj["id"])
-
                         st.download_button(
                             label="Download Result DXF",
                             data=data,
@@ -706,7 +696,7 @@ if job_id:
                             mime="application/dxf",
                             type="primary",
                         )
-                    except Exception as e:
+                        except Exception as e:
                         st.error("Failed to prepare download")
                         st.exception(e)
 
