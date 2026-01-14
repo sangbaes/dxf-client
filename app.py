@@ -271,7 +271,8 @@ def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
         return []
 
     files = res.get("files", [])
-    files = [f for f in files if f.get("name", "").lower().endswith(".json")]
+    # Only show job META files for DXF jobs (exclude worker heartbeat, manifests, etc.)
+    files = [f for f in files if f.get("name","").lower().endswith(".dxf.json")]
     return files
 
 
@@ -350,13 +351,15 @@ def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30):
         except Exception:
             return None
 
-    # META에서 __worker__*.json 찾기
+    # META에서 __worker__*.json 찾기 (Drive query의 name contains가 환경에 따라 누락되는 경우가 있어 전체 목록 후 필터링)
     res = drive.files().list(
-        q=f"'{meta_folder_id}' in parents and trashed=false and name contains '__worker__'",
+        q=f"'{meta_folder_id}' in parents and trashed=false",
         fields="files(id,name)",
+        orderBy="modifiedTime desc",
         pageSize=200,
     ).execute()
-    files = res.get("files", [])
+    files = [f for f in res.get("files", []) if (f.get("name","").startswith("__worker__") and f.get("name","").lower().endswith(".json"))]
+
 
     now = _dt.datetime.now(_dt.timezone.utc)
 
@@ -726,27 +729,3 @@ if job_id:
 
     else:
         st.info("META file not found for this job yet")
-# ==================================================
-# 🔧 Developer Debug Panel (DEV ONLY)
-# ==================================================
-
-DEV_MODE = True  # 나중에 False / env / secrets로 전환
-
-if DEV_MODE:
-    st.markdown("---")
-    with st.expander("🔧 Developer Debug Panel", expanded=False):
-
-        st.subheader("🫀 Worker Heartbeat Raw")
-        st.json(worker_heartbeat_raw or {})
-
-        st.subheader("🚦 Worker Alive Check")
-        st.write({
-            "now_iso": now_iso,
-            "heartbeat_ts": heartbeat_ts,
-            "diff_sec": diff_sec,
-            "alive_threshold_sec": HEARTBEAT_TIMEOUT,
-            "is_worker_alive": is_worker_alive,
-        })
-
-        st.subheader("📦 Job Meta Raw")
-        st.json(job_meta or {})
