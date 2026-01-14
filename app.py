@@ -272,6 +272,42 @@ def _make_batch_id() -> str:
 
 
 # =========================
+
+def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30, limit: int = 50):
+    """Return active worker heartbeats from META folder."""
+    q = f"'{meta_folder_id}' in parents and trashed=false and name contains '__worker__'"
+    res = drive.files().list(
+        q=q,
+        fields="files(id,name,modifiedTime,createdTime,size)",
+        orderBy="modifiedTime desc",
+        pageSize=limit
+    ).execute()
+    files = res.get("files", [])
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    active = []
+    for f in files:
+        try:
+            meta = download_json(drive, f["id"])
+            if meta.get("type") != "worker_heartbeat":
+                continue
+            updated_at = meta.get("updated_at")
+            if not updated_at:
+                continue
+            # Python 3.9: fromisoformat handles '+09:00' offsets
+            dt = datetime.datetime.fromisoformat(updated_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            age = (now - dt.astimezone(datetime.timezone.utc)).total_seconds()
+            if age <= ttl_sec:
+                active.append((age, meta))
+        except Exception:
+            continue
+
+    # sort by worker_id for stable ordering (not by age)
+    active.sort(key=lambda x: (x[1].get("worker_id") or "", x[0]))
+    return [m for _, m in active]
+
 # UI
 # =========================
 st.set_page_config(page_title="DXF Client", layout="centered")
@@ -312,7 +348,6 @@ except Exception as e:
     st.stop()
 
 st.success("✅ Connected to Google Drive")
-st.caption(f"DXF_SHARED_FOLDER_ID = {DXF_SHARED_FOLDER_ID}")
 
 # Sidebar controls
 st.sidebar.header("Options")
@@ -320,9 +355,19 @@ auto_refresh = st.sidebar.checkbox("Auto-refresh status", value=True)
 refresh_sec = st.sidebar.slider("Refresh interval (sec)", 3, 30, 5)
 
 st.sidebar.divider()
-st.sidebar.caption("Folders")
-for k in SUBFOLDERS:
-    st.sidebar.write(f"- {k}: `{folders[k]}`")
+st.sidebar.subheader("Worker status")
+
+active_workers = list_worker_heartbeats(drive, folders["META"], ttl_sec=30)
+
+if not active_workers:
+    st.sidebar.write("작업워커 없음")
+else:
+    for i, w in enumerate(active_workers, start=1):
+        stt = w.get("status")
+        if stt == "busy":
+            st.sidebar.write(f"{i}번워커 번역중")
+        else:
+            st.sidebar.write(f"{i}번워커 대기중")
 
 # Upload section
 st.subheader("1) Upload DXF Files (Batch)")
