@@ -24,6 +24,50 @@ import ssl
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.errors import HttpError
+import time
+import random
+import ssl
+
+TRANSIENT_EXC_NAMES = {
+    "SSLError",
+    "HttpLib2Error",
+    "ServerNotFoundError",
+    "TimeoutError",
+    "ConnectionError",
+}
+
+def _is_transient_exc(e: Exception) -> bool:
+    name = type(e).__name__
+    if name in TRANSIENT_EXC_NAMES:
+        return True
+    # ssl.SSLError subclasses show up as SSLError too, but keep fallback by message
+    msg = str(e).lower()
+    if "decryption_failed_or_bad_record_mac" in msg:
+        return True
+    if "bad record mac" in msg:
+        return True
+    if "tls" in msg and "error" in msg:
+        return True
+    return False
+
+def _with_retry(fn, *, tries: int = 5, base_sleep: float = 0.6, max_sleep: float = 6.0, what: str = "operation"):
+    """Retry transient network/SSL errors with exponential backoff + jitter."""
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+            except Exception as e:
+            last = e
+            if not _is_transient_exc(e) or attempt == tries:
+                raise
+            sleep = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
+            sleep *= (0.7 + random.random() * 0.6)  # jitter 0.7~1.3
+            try:
+                st.warning(f"⚠️ {what} 중 일시적 네트워크 오류 발생. 재시도 {attempt}/{tries} ...")
+            except Exception:
+                pass
+            time.sleep(sleep)
+    raise last
 
 
 # =========================
@@ -202,7 +246,7 @@ def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
     downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = _with_retry(lambda: downloader.next_chunk(), what='META 읽기')
 
     buf.seek(0)
     return json.loads(buf.read().decode("utf-8"))
@@ -219,7 +263,7 @@ def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
 
     try:
         res = drive_execute(req, retries=5)
-    except Exception as e:
+        except Exception as e:
         st.warning(
             f"Google Drive query temporarily failed. Will retry automatically.\n"
             f"Reason: {type(e).__name__}"
@@ -237,7 +281,7 @@ def download_file_bytes(drive, file_id: str) -> bytes:
     downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = _with_retry(lambda: downloader.next_chunk(), what='META 읽기')
     return buf.getvalue()
 
 
@@ -402,8 +446,8 @@ with st.expander("About", expanded=False):
 try:
     drive = get_drive_service()
     folders = get_subfolder_ids(drive)
-except Exception as e:
-    st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
+    except Exception as e:
+            st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
     st.exception(e)
     st.stop()
 
@@ -450,7 +494,7 @@ if uploaded_list:
     too_big = [u for u in uploaded_list if u.size > MAX_FILE_BYTES]
 
     if too_big:
-        st.error(
+                st.error(
             f"The following files are too large. Maximum size is {MAX_FILE_MB}MB:\n- "
             + "\n- ".join([f"{u.name} ({u.size/1024/1024:.1f}MB)" for u in too_big])
         )
@@ -537,7 +581,7 @@ if uploaded_list:
 
                         ok_count += 1
 
-                    except Exception as e:
+                        except Exception as e:
                         errors.append({"file": uploaded.name, "error": str(e)})
 
                     # UI progress update
@@ -558,8 +602,8 @@ if uploaded_list:
             # Write manifest
             try:
                 upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
-            except Exception as e:
-                st.error("❌ Failed to save manifest")
+                except Exception as e:
+                        st.error("❌ Failed to save manifest")
                 st.exception(e)
 
             # Store batch context
@@ -610,11 +654,21 @@ with col_b:
 
 if job_id:
     meta_name = f"{job_id}.json"
-    meta = None
+            meta = None
+
+        # META를 읽지 못하면 이 섹션은 중단
+        st.stop()
+
     try:
+            try:
         meta = read_json_file_by_name(drive, folders["META"], meta_name)
-    except Exception as e:
-        st.error("Failed to read META")
+        except Exception as e:
+                st.error(f"Failed to read META
+
+{type(e).__name__}: {e}")
+                meta = None
+        except Exception as e:
+                st.error("Failed to read META")
         st.exception(e)
 
     if meta:
@@ -625,7 +679,7 @@ if job_id:
         st.progress(min(max(prog, 0), 100) / 100.0)
 
         if meta.get("status") == "error":
-            st.error("Job failed")
+                    st.error("Job failed")
             if meta.get("error"):
                 st.code(meta.get("error"))
 
@@ -651,8 +705,8 @@ if job_id:
                             mime="application/dxf",
                             type="primary",
                         )
-                    except Exception as e:
-                        st.error("Failed to prepare download")
+                        except Exception as e:
+                                st.error("Failed to prepare download")
                         st.exception(e)
 
     else:
