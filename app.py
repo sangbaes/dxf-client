@@ -263,7 +263,7 @@ def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
 
     try:
         res = drive_execute(req, retries=5)
-        except Exception as e:
+    except Exception as e:
         st.warning(
             f"Google Drive query temporarily failed. Will retry automatically.\n"
             f"Reason: {type(e).__name__}"
