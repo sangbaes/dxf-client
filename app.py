@@ -56,7 +56,7 @@ def _with_retry(fn, *, tries: int = 5, base_sleep: float = 0.6, max_sleep: float
     for attempt in range(1, tries + 1):
         try:
             return fn()
-            except Exception as e:
+        except Exception as e:
             last = e
             if not _is_transient_exc(e) or attempt == tries:
                 raise
