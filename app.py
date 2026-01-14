@@ -447,7 +447,7 @@ with st.expander("About", expanded=False):
 try:
     drive = get_drive_service()
     folders = get_subfolder_ids(drive)
-    except Exception as e:
+except Exception as e:
     st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
     st.exception(e)
     st.stop()
