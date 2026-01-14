@@ -729,3 +729,27 @@ if job_id:
 
     else:
         st.info("META file not found for this job yet")
+# ==================================================
+# 🔧 Developer Debug Panel (DEV ONLY)
+# ==================================================
+
+DEV_MODE = True  # 나중에 False / env / secrets로 전환
+
+if DEV_MODE:
+    st.markdown("---")
+    with st.expander("🔧 Developer Debug Panel", expanded=False):
+
+        st.subheader("🫀 Worker Heartbeat Raw")
+        st.json(worker_heartbeat_raw or {})
+
+        st.subheader("🚦 Worker Alive Check")
+        st.write({
+            "now_iso": now_iso,
+            "heartbeat_ts": heartbeat_ts,
+            "diff_sec": diff_sec,
+            "alive_threshold_sec": HEARTBEAT_TIMEOUT,
+            "is_worker_alive": is_worker_alive,
+        })
+
+        st.subheader("📦 Job Meta Raw")
+        st.json(job_meta or {})
