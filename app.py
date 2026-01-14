@@ -13,6 +13,7 @@ from pathlib import Path
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from io import BytesIO
+import re
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
@@ -49,9 +50,10 @@ def now_seoul_iso() -> str:
 def make_job_id(original_name: str) -> str:
     ts = datetime.now(SEOUL_TZ).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
-    # Remove spaces and keep only safe characters
-    safe = original_name.replace(" ", "")
-    safe = "".join(c for c in safe if c.isalnum() or c in ("-", "_", "."))
+    # Remove spaces and keep only safe ASCII characters for Drive filenames.
+    # Some environments/HTTP stacks are surprisingly fragile with non-ASCII names.
+    base = original_name.replace(" ", "")
+    safe = "".join(c for c in base if c.isascii() and (c.isalnum() or c in ("-", "_", ".")))
     safe = safe[:40] if safe else "file"
     return f"{ts}_{short}_{safe}"
 
@@ -139,50 +141,24 @@ def get_subfolder_ids(drive):
     return ids
 
 
-def upload_file_to_folder(
-    drive,
-    folder_id: str,
-    filename: str,
-    file_obj,
-    mime: str,
-    *,
-    chunk_size: int = 5 * 1024 * 1024,
-    max_chunk_retries: int = 8,
-    base_sleep: float = 0.8,
-):
-    """
-    Resumable upload with per-chunk retry.
+def upload_file_to_folder(drive, folder_id: str, filename: str, file_obj, mime: str):
+    """Upload a file-like object to Drive.
 
-    Why this exists:
-    - Avoid reading the entire file into memory (use file-like object)
-    - Be resilient to transient network / Drive hiccups mid-upload
+    IMPORTANT: We intentionally default to *non-resumable* multipart upload.
+    We've seen 'Redirected but the response is missing a Location: header.'
+    when using resumable uploads in some environments. Multipart is more stable
+    for files in our size range.
     """
-    # Ensure we're at start (Streamlit UploadedFile supports seek)
     try:
         file_obj.seek(0)
     except Exception:
         pass
 
-    media = MediaIoBaseUpload(file_obj, mimetype=mime, resumable=True, chunksize=chunk_size)
+    media = MediaIoBaseUpload(file_obj, mimetype=mime, resumable=False)
     metadata = {"name": filename, "parents": [folder_id]}
     req = drive.files().create(body=metadata, media_body=media, fields="id,name,size,createdTime")
-
-    resp = None
-    chunk_retry = 0
-
-    while resp is None:
-        try:
-            status, resp = req.next_chunk()
-            if status:
-                st.session_state["upload_progress"] = int(status.progress() * 100)
-            chunk_retry = 0  # reset after a successful chunk
-        except (HttpError, OSError, ssl.SSLError, socket.timeout) as e:
-            chunk_retry += 1
-            if chunk_retry > max_chunk_retries:
-                raise
-            time.sleep(base_sleep * (2 ** min(chunk_retry, 6)))
-
-    return resp
+    # execute with retry/backoff
+    return drive_execute(req, retries=6, base_sleep=0.8)
 
 
 def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
@@ -283,8 +259,8 @@ def _safe_name(name: str) -> str:
     safe = Path(name).name
     # Replace spaces with underscores
     safe = safe.replace(" ", "_")
-    # Remove any remaining problematic characters
-    safe = "".join(c for c in safe if c.isalnum() or c in ("-", "_", "."))
+    # Remove any remaining problematic characters (keep ASCII only for stability)
+    safe = "".join(c for c in safe if c.isascii() and (c.isalnum() or c in ("-", "_", ".")))
     return safe if safe else "file.dxf"
 
 
@@ -379,7 +355,7 @@ if uploaded_list:
             manifest_filename = f"{batch_id}__manifest.json"
             manifest_payload = {
                 "batch_id": batch_id,
-                "status": "manifest",
+                "status": "uploading",
                 "created_at": created_at,
                 "updated_at": created_at,
                 "total": total_files,
@@ -397,7 +373,9 @@ if uploaded_list:
                 for idx, uploaded in enumerate(uploaded_list, 1):
                     try:
                         safe_orig = _safe_name(uploaded.name)
-                        file_obj = uploaded  # stream directly; avoid loading whole file into memory
+                        # Streamlit's UploadedFile is a file-like object.
+                        # Avoid .getvalue() to prevent large in-memory copies.
+                        file_obj = uploaded
                         try:
                             file_obj.seek(0)
                         except Exception:
@@ -428,7 +406,7 @@ if uploaded_list:
                             folders["INBOX"],
                             inbox_name,
                             file_obj,
-                            mime="application/dxf"
+                            mime=getattr(uploaded, "type", None) or "application/dxf"
                         )
                         meta_payload["inbox_file_id"] = resp.get("id")
                         meta_payload["progress"] = 5
