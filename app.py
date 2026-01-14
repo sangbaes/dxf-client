@@ -487,6 +487,12 @@ else:
         if wid:
             st.sidebar.caption(wid)
 
+uploaded_list = st.file_uploader(
+    "Select DXF files (multiple allowed)",
+    type=["dxf", "DXF"],
+    accept_multiple_files=True,
+)
+
 if uploaded_list:
     total_files = len(uploaded_list)
     total_size = sum(u.size for u in uploaded_list)
