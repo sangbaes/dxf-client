@@ -654,32 +654,26 @@ with col_b:
 
 if job_id:
     meta_name = f"{job_id}.json"
-            meta = None
-
-        # META를 읽지 못하면 이 섹션은 중단
-        st.stop()
 
     try:
-            try:
         meta = read_json_file_by_name(drive, folders["META"], meta_name)
-        except Exception as e:
-                st.error(f"Failed to read META
-
-{type(e).__name__}: {e}")
-                meta = None
-        except Exception as e:
-                st.error("Failed to read META")
+    except Exception as e:
+        st.error("Failed to read META")
         st.exception(e)
+        meta = None
 
-    if meta:
+    if not meta:
+        st.info("META file not found for this job yet")
+    else:
         st.write(f"**status:** `{meta.get('status')}`")
         st.write(f"**updated_at:** `{meta.get('updated_at')}`")
         st.write(f"**message:** {meta.get('message')}")
+
         prog = int(meta.get("progress", 0) or 0)
         st.progress(min(max(prog, 0), 100) / 100.0)
 
         if meta.get("status") == "error":
-                    st.error("Job failed")
+            st.error("Job failed")
             if meta.get("error"):
                 st.code(meta.get("error"))
 
@@ -691,13 +685,20 @@ if job_id:
                 st.success("✅ Translation completed")
                 st.write(f"Result file: `{done_file}`")
 
-                done_obj = find_file_in_folder_by_name(drive, folders["DONE"], done_file)
+                done_obj = find_file_in_folder_by_name(
+                    drive, folders["DONE"], done_file
+                )
                 if not done_obj:
-                    st.warning("Result file not found in DONE folder yet. Please try again later.")
+                    st.warning(
+                        "Result file not found in DONE folder yet. Please try again later."
+                    )
                 else:
                     try:
-                        with st.spinner("Preparing download... (may take time for large files)"):
+                        with st.spinner(
+                            "Preparing download... (may take time for large files)"
+                        ):
                             data = download_file_bytes(drive, done_obj["id"])
+
                         st.download_button(
                             label="Download Result DXF",
                             data=data,
@@ -706,7 +707,7 @@ if job_id:
                             type="primary",
                         )
                     except Exception as e:
-                                st.error("Failed to prepare download")
+                        st.error("Failed to prepare download")
                         st.exception(e)
 
     else:
