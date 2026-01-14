@@ -273,6 +273,19 @@ def _make_batch_id() -> str:
 
 # =========================
 
+
+def _parse_iso_dt(s: str):
+    """Parse ISO datetime from worker heartbeat. Accepts 'Z' suffix."""
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
 def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30, limit: int = 50):
     """Return active worker heartbeats from META folder."""
     q = f"'{meta_folder_id}' in parents and trashed=false and name contains '__worker__'"
