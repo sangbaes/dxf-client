@@ -670,7 +670,7 @@ if job_id:
         st.progress(min(max(prog, 0), 100) / 100.0)
 
         if meta.get("status") == "error":
-                    st.error("Job failed")
+            st.error("Job failed")
             if meta.get("error"):
                 st.code(meta.get("error"))
 
@@ -689,6 +689,7 @@ if job_id:
                     try:
                         with st.spinner("Preparing download... (may take time for large files)"):
                             data = download_file_bytes(drive, done_obj["id"])
+
                         st.download_button(
                             label="Download Result DXF",
                             data=data,
@@ -696,7 +697,7 @@ if job_id:
                             mime="application/dxf",
                             type="primary",
                         )
-                        except Exception as e:
+                    except Exception as e:
                         st.error("Failed to prepare download")
                         st.exception(e)
 
