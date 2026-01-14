@@ -286,18 +286,64 @@ def _parse_iso_dt(s: str):
         return None
 
 
-def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30, limit: int = 50):
-    """Return active worker heartbeats from META folder."""
-    q = f"'{meta_folder_id}' in parents and trashed=false and name contains '__worker__'"
+def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30):
+    """
+    Returns:
+      active_workers: list[dict] (updated within ttl_sec)
+      last_seen: datetime (most recent heartbeat regardless of ttl), or None
+    Notes:
+      Uses local datetime module alias to avoid import-name collisions.
+    """
+    import datetime as _dt
+
+    def _parse_iso_dt(s: str):
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return _dt.datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    # META에서 __worker__*.json 찾기
     res = drive.files().list(
-        q=q,
-        fields="files(id,name,modifiedTime,createdTime,size)",
-        orderBy="modifiedTime desc",
-        pageSize=limit
+        q=f"'{meta_folder_id}' in parents and trashed=false and name contains '__worker__'",
+        fields="files(id,name)",
+        pageSize=200,
     ).execute()
     files = res.get("files", [])
-    import datetime as _dt
+
     now = _dt.datetime.now(_dt.timezone.utc)
+
+    active = []
+    last_seen = None
+
+    for f in files:
+        try:
+            hb = download_json(drive, f["id"])  # 기존 함수 재사용
+            updated_at = hb.get("updated_at")
+            hb_time = _parse_iso_dt(updated_at)
+            if hb_time is None:
+                continue
+            if hb_time.tzinfo is None:
+                hb_time = hb_time.replace(tzinfo=_dt.timezone.utc)
+
+            # last_seen 갱신
+            if last_seen is None or hb_time > last_seen:
+                last_seen = hb_time
+
+            age = (now - hb_time).total_seconds()
+            if age <= ttl_sec:
+                hb["_hb_time"] = hb_time  # 정렬/표시에 사용(내부용)
+                active.append(hb)
+        except Exception:
+            continue
+
+    # 최근 업데이트 우선 정렬
+    active.sort(key=lambda x: x.get("_hb_time") or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc), reverse=True)
+    return active, last_seen
+
 
     active = []
     for f in files:
@@ -370,26 +416,31 @@ refresh_sec = st.sidebar.slider("Refresh interval (sec)", 3, 30, 5)
 
 st.sidebar.divider()
 st.sidebar.subheader("Worker status")
-
-active_workers = list_worker_heartbeats(drive, folders["META"], ttl_sec=30)
+active_workers, last_seen = list_worker_heartbeats(drive, folders["META"], ttl_sec=30)
 
 if not active_workers:
-    st.sidebar.write("작업워커 없음")
+    st.sidebar.markdown("🔴 **작업워커 없음**")
+    if last_seen is not None:
+        try:
+            last_seen_local = last_seen.astimezone()
+        except Exception:
+            last_seen_local = last_seen
+        st.sidebar.caption(f"마지막 접속: {last_seen_local.strftime('%Y-%m-%d %H:%M:%S')}")
 else:
-    for i, w in enumerate(active_workers, start=1):
-        stt = w.get("status")
+    # 여러 워커를 최근 heartbeat 순으로 표시
+    for idx, hb in enumerate(active_workers, start=1):
+        stt = (hb.get("status") or "").lower()
         if stt == "busy":
-            st.sidebar.write(f"{i}번워커 번역중")
+            st.sidebar.markdown(f"🟡 **{idx}번워커 번역중**")
+            cj = hb.get("current_job_id")
+            if cj:
+                st.sidebar.caption(f"job: {cj}")
         else:
-            st.sidebar.write(f"{i}번워커 대기중")
-
-# Upload section
-st.subheader("1) Upload DXF Files (Batch)")
-uploaded_list = st.file_uploader(
-    "Select DXF files (multiple allowed)",
-    type=["dxf"],
-    accept_multiple_files=True
-)
+            st.sidebar.markdown(f"🟢 **{idx}번워커 대기중**")
+        # 필요하면 worker_id를 아래에 표시(너무 길면 숨김 가능)
+        wid = hb.get("worker_id")
+        if wid:
+            st.sidebar.caption(wid)
 
 if uploaded_list:
     total_files = len(uploaded_list)
