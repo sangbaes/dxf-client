@@ -661,7 +661,7 @@ if job_id:
         st.error(f"Failed to read META\n\n{type(e).__name__}: {e}")
         meta = None
 
-    if meta:
+
     if meta:
         st.write(f"**status:** `{meta.get('status')}`")
         st.write(f"**updated_at:** `{meta.get('updated_at')}`")
