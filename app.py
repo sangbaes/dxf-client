@@ -281,7 +281,7 @@ def _parse_iso_dt(s: str):
     try:
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        return datetime.datetime.fromisoformat(s)
+        return datetime.fromisoformat(s)
     except Exception:
         return None
 
@@ -296,7 +296,8 @@ def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30, limit:
         pageSize=limit
     ).execute()
     files = res.get("files", [])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
 
     active = []
     for f in files:
@@ -308,10 +309,10 @@ def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30, limit:
             if not updated_at:
                 continue
             # Python 3.9: fromisoformat handles '+09:00' offsets
-            dt = datetime.datetime.fromisoformat(updated_at)
+            dt = _dt.datetime.fromisoformat(updated_at)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-            age = (now - dt.astimezone(datetime.timezone.utc)).total_seconds()
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            age = (now - dt.astimezone(_dt.timezone.utc)).total_seconds()
             if age <= ttl_sec:
                 active.append((age, meta))
         except Exception:
