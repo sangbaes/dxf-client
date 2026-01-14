@@ -603,7 +603,7 @@ if uploaded_list:
             # Write manifest
             try:
                 upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
-                except Exception as e:
+            except Exception as e:
                 st.error("❌ Failed to save manifest")
                 st.exception(e)
 
