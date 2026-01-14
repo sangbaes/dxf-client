@@ -139,16 +139,48 @@ def get_subfolder_ids(drive):
     return ids
 
 
-def upload_file_to_folder(drive, folder_id: str, filename: str, file_bytes: bytes, mime: str):
-    media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mime, resumable=True)
+def upload_file_to_folder(
+    drive,
+    folder_id: str,
+    filename: str,
+    file_obj,
+    mime: str,
+    *,
+    chunk_size: int = 5 * 1024 * 1024,
+    max_chunk_retries: int = 8,
+    base_sleep: float = 0.8,
+):
+    """
+    Resumable upload with per-chunk retry.
+
+    Why this exists:
+    - Avoid reading the entire file into memory (use file-like object)
+    - Be resilient to transient network / Drive hiccups mid-upload
+    """
+    # Ensure we're at start (Streamlit UploadedFile supports seek)
+    try:
+        file_obj.seek(0)
+    except Exception:
+        pass
+
+    media = MediaIoBaseUpload(file_obj, mimetype=mime, resumable=True, chunksize=chunk_size)
     metadata = {"name": filename, "parents": [folder_id]}
     req = drive.files().create(body=metadata, media_body=media, fields="id,name,size,createdTime")
+
     resp = None
+    chunk_retry = 0
 
     while resp is None:
-        status, resp = req.next_chunk()
-        if status:
-            st.session_state["upload_progress"] = int(status.progress() * 100)
+        try:
+            status, resp = req.next_chunk()
+            if status:
+                st.session_state["upload_progress"] = int(status.progress() * 100)
+            chunk_retry = 0  # reset after a successful chunk
+        except (HttpError, OSError, ssl.SSLError, socket.timeout) as e:
+            chunk_retry += 1
+            if chunk_retry > max_chunk_retries:
+                raise
+            time.sleep(base_sleep * (2 ** min(chunk_retry, 6)))
 
     return resp
 
@@ -347,7 +379,7 @@ if uploaded_list:
             manifest_filename = f"{batch_id}__manifest.json"
             manifest_payload = {
                 "batch_id": batch_id,
-                "status": "uploading",
+                "status": "manifest",
                 "created_at": created_at,
                 "updated_at": created_at,
                 "total": total_files,
@@ -365,7 +397,11 @@ if uploaded_list:
                 for idx, uploaded in enumerate(uploaded_list, 1):
                     try:
                         safe_orig = _safe_name(uploaded.name)
-                        file_bytes = uploaded.getvalue()
+                        file_obj = uploaded  # stream directly; avoid loading whole file into memory
+                        try:
+                            file_obj.seek(0)
+                        except Exception:
+                            pass
 
                         job_id = make_job_id(safe_orig)
 
@@ -391,7 +427,7 @@ if uploaded_list:
                             drive,
                             folders["INBOX"],
                             inbox_name,
-                            file_bytes,
+                            file_obj,
                             mime="application/dxf"
                         )
                         meta_payload["inbox_file_id"] = resp.get("id")
