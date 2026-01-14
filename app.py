@@ -263,7 +263,7 @@ def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
 
     try:
         res = drive_execute(req, retries=5)
-        except Exception as e:
+    except Exception as e:
         st.warning(
             f"Google Drive query temporarily failed. Will retry automatically.\n"
             f"Reason: {type(e).__name__}"
@@ -446,7 +446,7 @@ with st.expander("About", expanded=False):
 try:
     drive = get_drive_service()
     folders = get_subfolder_ids(drive)
-    except Exception as e:
+except Exception as e:
             st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
     st.exception(e)
     st.stop()
@@ -602,7 +602,7 @@ if uploaded_list:
             # Write manifest
             try:
                 upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
-                except Exception as e:
+            except Exception as e:
                         st.error("❌ Failed to save manifest")
                 st.exception(e)
 
@@ -705,7 +705,7 @@ if job_id:
                             mime="application/dxf",
                             type="primary",
                         )
-                        except Exception as e:
+                    except Exception as e:
                                 st.error("Failed to prepare download")
                         st.exception(e)
 
