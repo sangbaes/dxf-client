@@ -709,3 +709,47 @@ if job_id:
 
     else:
         st.info("META file not found for this job yet")
+
+# ==================================================
+# 🔧 Developer Debug Panel (DEV ONLY)
+# ==================================================
+
+DEV_MODE = True  # 배포 시 False / env / secrets 로 제어 추천
+
+def _g(name, default="(undefined)"):
+    """safe get from globals without NameError"""
+    return globals().get(name, default)
+
+if DEV_MODE:
+    st.markdown("---")
+    with st.expander("🔧 Developer Debug Panel", expanded=False):
+
+        # 1) Worker heartbeat raw
+        st.subheader("🫀 Worker Heartbeat Raw")
+        hb_raw = _g("worker_heartbeat_raw", None)
+        st.json(hb_raw or {})
+
+        # 2) Worker alive 판단 로직
+        st.subheader("🚦 Worker Alive Check")
+        st.write({
+            "now_iso": _g("now_iso"),
+            "heartbeat_ts": _g("heartbeat_ts"),
+            "diff_sec": _g("diff_sec"),
+            "alive_threshold_sec": _g("HEARTBEAT_TIMEOUT"),
+            "is_worker_alive": _g("is_worker_alive"),
+        })
+
+        # 3) Job meta raw
+        st.subheader("📦 Job Meta Raw")
+        m = _g("meta", None)
+        st.json(m or {})
+
+        # 4) Refresh 상태 (네 코드 기준 변수/세션 둘 다 보여주기)
+        st.subheader("🔄 Refresh Info")
+        st.write({
+            "auto_refresh(var)": _g("auto_refresh"),
+            "refresh_sec(var)": _g("refresh_sec"),
+            "manual_refresh_clicked": _g("manual_refresh"),
+            "session_state.auto_refresh": st.session_state.get("auto_refresh", "(missing)"),
+            "session_state.refresh_interval": st.session_state.get("refresh_interval", "(missing)"),
+        })
