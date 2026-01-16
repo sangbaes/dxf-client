@@ -1,4 +1,20 @@
-streamlit
-google-auth
-google-api-python-client
-google-auth-httplib2
+# Streamlit
+streamlit==1.31.0
+
+# Firebase
+firebase-admin==6.5.0
+
+# Google Drive API
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.126.0
+
+# DXF Processing
+ezdxf==1.3.0
+
+# Translation
+requests==2.31.0
+
+# Environment Variables
+python-dotenv==1.0.1

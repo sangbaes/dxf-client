@@ -1,756 +1,541 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DXF Translation Client (English Version)
-========================================
-Streamlit app for uploading DXF files and monitoring translation jobs
+DXF Translation Client - Firebase RTDB Version
+===============================================
+Streamlit app for uploading DXF files and monitoring translation jobs via Firebase RTDB
 """
-import base64
-import json
+
+import os
 import time
 import uuid
 from pathlib import Path
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from io import BytesIO
-import re
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 
 import streamlit as st
+
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, db
+
+# Google Drive
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-import socket
-import ssl
-import httplib2
-from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.errors import HttpError
-import time
-import random
-import ssl
-
-TRANSIENT_EXC_NAMES = {
-    "SSLError",
-    "HttpLib2Error",
-    "ServerNotFoundError",
-    "TimeoutError",
-    "ConnectionError",
-}
-
-def _is_transient_exc(e: Exception) -> bool:
-    name = type(e).__name__
-    if name in TRANSIENT_EXC_NAMES:
-        return True
-    # ssl.SSLError subclasses show up as SSLError too, but keep fallback by message
-    msg = str(e).lower()
-    if "decryption_failed_or_bad_record_mac" in msg:
-        return True
-    if "bad record mac" in msg:
-        return True
-    if "tls" in msg and "error" in msg:
-        return True
-    return False
-
-def _with_retry(fn, *, tries: int = 5, base_sleep: float = 0.6, max_sleep: float = 6.0, what: str = "operation"):
-    """Retry transient network/SSL errors with exponential backoff + jitter."""
-    last = None
-    for attempt in range(1, tries + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if not _is_transient_exc(e) or attempt == tries:
-                raise
-            sleep = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
-            sleep *= (0.7 + random.random() * 0.6)  # jitter 0.7~1.3
-            try:
-                st.warning(f"⚠️ {what} 중 일시적 네트워크 오류 발생. 재시도 {attempt}/{tries} ...")
-            except Exception:
-                pass
-            time.sleep(sleep)
-    raise last
-
 
 # =========================
 # Config
 # =========================
-DXF_SHARED_FOLDER_ID = "1qhx_xTGdOusxhV0xN2df4Kc8JTfh3zTd"
+INBOX_FOLDER_ID = os.getenv("INBOX_FOLDER_ID", "1QFhwS0aMPbwjtpC0k83ZJr8-abHksNhJ")
+DONE_FOLDER_ID = os.getenv("DONE_FOLDER_ID", "1rC_1x1HAoJZ65YuGLDw8GikyBbqXWIJa")
 
-SUBFOLDERS = ["INBOX", "WORKING", "DONE", "META"]
+SEOUL_TZ = timezone(timedelta(hours=9))
 MAX_FILE_MB = 200
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
-SEOUL_TZ = timezone(timedelta(hours=9))
-
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+# =========================
+# Firebase Initialization
+# =========================
+@st.cache_resource
+def init_firebase():
+    """Initialize Firebase (once per app lifetime)"""
+    if not firebase_admin._apps:
+        # Streamlit Secrets에서 Firebase 설정 읽기
+        firebase_config = dict(st.secrets["firebase"])
+        
+        cred = credentials.Certificate(firebase_config)
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': st.secrets["firebase"]["databaseURL"]
+        })
+    
+    return db.reference()
 
 # =========================
-# Helpers
+# Google Drive Helpers
 # =========================
-def now_seoul_iso() -> str:
-    return datetime.now(SEOUL_TZ).isoformat(timespec="seconds")
-
-
-def make_job_id(original_name: str) -> str:
-    ts = datetime.now(SEOUL_TZ).strftime("%Y%m%d_%H%M%S")
-    short = uuid.uuid4().hex[:8]
-    # Remove spaces and keep only safe ASCII characters for Drive filenames.
-    # Some environments/HTTP stacks are surprisingly fragile with non-ASCII names.
-    base = original_name.replace(" ", "")
-    safe = "".join(c for c in base if c.isascii() and (c.isalnum() or c in ("-", "_", ".")))
-    safe = safe[:40] if safe else "file"
-    return f"{ts}_{short}_{safe}"
-
-
-def drive_execute(req, retries: int = 5, base_sleep: float = 0.6):
-    """Execute Drive API request with retry logic for network stability"""
-    last_err = None
-    for i in range(retries + 1):
-        try:
-            return req.execute(num_retries=1)
-        except (HttpError, OSError, ssl.SSLError, socket.timeout) as e:
-            last_err = e
-            if i >= retries:
-                raise
-            time.sleep(base_sleep * (2 ** i))
-    raise last_err
-
-
-def load_service_account_info():
-    # Base64 method (Streamlit Secrets: SERVICE_ACCOUNT_B64)
-    if "SERVICE_ACCOUNT_B64" not in st.secrets:
-        raise RuntimeError("SERVICE_ACCOUNT_B64 not found in Streamlit Secrets")
-
-    raw = base64.b64decode(st.secrets["SERVICE_ACCOUNT_B64"].encode("ascii"))
-    info = json.loads(raw.decode("utf-8"))
-
-    # Fix escaped newlines in private_key
-    if "private_key" in info and isinstance(info["private_key"], str):
-        info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
-
-    return info
-
-
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-
-
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
-    s = st.secrets["drive_oauth"]
+    """Get Google Drive service (cached)"""
+    oauth = st.secrets["drive_oauth"]
+    
     creds = Credentials(
         token=None,
-        refresh_token=s["refresh_token"],
+        refresh_token=oauth["refresh_token"],
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=s["client_id"],
-        client_secret=s["client_secret"],
+        client_id=oauth["client_id"],
+        client_secret=oauth["client_secret"],
         scopes=SCOPES,
     )
     creds.refresh(Request())
-
-    # Use AuthorizedHttp with timeout for better stability on Streamlit Cloud
-    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
-    return build("drive", "v3", http=authed_http, cache_discovery=False)
+    
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def find_or_create_folder(drive, parent_id: str, name: str) -> str:
-    q = (
-        f"'{parent_id}' in parents and "
-        f"name = '{name}' and "
-        "mimeType = 'application/vnd.google-apps.folder' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name)").execute(num_retries=3)
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"]
-
-    metadata = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    folder = drive.files().create(body=metadata, fields="id").execute()
-    return folder["id"]
-
-
-def get_subfolder_ids(drive):
-    if "subfolder_ids" in st.session_state:
-        return st.session_state["subfolder_ids"]
-
-    ids = {}
-    for name in SUBFOLDERS:
-        ids[name] = find_or_create_folder(drive, DXF_SHARED_FOLDER_ID, name)
-
-    st.session_state["subfolder_ids"] = ids
-    return ids
-
-
-def upload_file_to_folder(drive, folder_id: str, filename: str, file_obj, mime: str):
-    """Upload a file-like object to Drive.
-
-    IMPORTANT: We intentionally default to *non-resumable* multipart upload.
-    We've seen 'Redirected but the response is missing a Location: header.'
-    when using resumable uploads in some environments. Multipart is more stable
-    for files in our size range.
-    """
+def upload_file_to_drive(drive, folder_id: str, filename: str, file_obj, mime: str = "application/dxf"):
+    """Upload file to Google Drive"""
     try:
         file_obj.seek(0)
     except Exception:
         pass
-
+    
     media = MediaIoBaseUpload(file_obj, mimetype=mime, resumable=False)
     metadata = {"name": filename, "parents": [folder_id]}
-    req = drive.files().create(body=metadata, media_body=media, fields="id,name,size,createdTime")
-    # execute with retry/backoff
-    return drive_execute(req, retries=6, base_sleep=0.8)
+    
+    req = drive.files().create(body=metadata, media_body=media, fields="id,name,size")
+    result = req.execute()
+    
+    return result
 
 
-def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
-    q = (
-        f"'{folder_id}' in parents and "
-        f"name = '{filename}' and "
-        "mimeType != 'application/vnd.google-apps.folder' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name)").execute()
-    files = res.get("files", [])
-
-    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
-
-    if files:
-        file_id = files[0]["id"]
-        updated = drive.files().update(fileId=file_id, media_body=media).execute()
-        return updated
-    else:
-        meta = {"name": filename, "parents": [folder_id]}
-        created = drive.files().create(body=meta, media_body=media, fields="id").execute()
-        return created
-
-
-def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
-    q = (
-        f"'{folder_id}' in parents and "
-        f"name = '{filename}' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name)").execute()
-    files = res.get("files", [])
-    if not files:
-        return None
-
-    file_id = files[0]["id"]
+def download_file_from_drive(drive, file_id: str) -> bytes:
+    """Download file from Google Drive"""
     request = drive.files().get_media(fileId=file_id)
-
-    buf = BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
+    
+    file_buffer = BytesIO()
+    downloader = MediaIoBaseDownload(file_buffer, request)
+    
     done = False
     while not done:
-        _, done = _with_retry(lambda: downloader.next_chunk(), what='META 읽기')
+        status, done = downloader.next_chunk()
+    
+    file_buffer.seek(0)
+    return file_buffer.read()
 
-    buf.seek(0)
-    return json.loads(buf.read().decode("utf-8"))
 
-
-def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
-    q = f"'{meta_folder_id}' in parents and trashed=false"
-    req = drive.files().list(
-        q=q,
-        fields="files(id,name,createdTime,modifiedTime,size)",
-        orderBy="modifiedTime desc",
-        pageSize=limit,
-    )
-
+def find_file_in_done_folder(drive, filename: str):
+    """Find file in DONE folder by name"""
+    query = f"'{DONE_FOLDER_ID}' in parents and name='{filename}' and trashed=false"
+    
     try:
-        res = drive_execute(req, retries=5)
-    except Exception as e:
-        st.warning(
-            f"Google Drive query temporarily failed. Will retry automatically.\n"
-            f"Reason: {type(e).__name__}"
-        )
-        return []
-
-    files = res.get("files", [])
-    # Only show job META files for DXF jobs (exclude worker heartbeat, manifests, etc.)
-    files = [f for f in files if f.get("name","").lower().endswith(".dxf.json")]
-    return files
-
-
-def download_file_bytes(drive, file_id: str) -> bytes:
-    request = drive.files().get_media(fileId=file_id)
-    buf = BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = _with_retry(lambda: downloader.next_chunk(), what='META 읽기')
-    return buf.getvalue()
-
-
-def find_file_in_folder_by_name(drive, folder_id: str, filename: str):
-    q = (
-        f"'{folder_id}' in parents and "
-        f"name = '{filename}' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name,size,modifiedTime)").execute()
-    files = res.get("files", [])
-    return files[0] if files else None
-
-
-def _safe_name(name: str) -> str:
-    """
-    Prevent weird path-ish names and remove spaces
-    """
-    safe = Path(name).name
-    # Replace spaces with underscores
-    safe = safe.replace(" ", "_")
-    # Remove any remaining problematic characters (keep ASCII only for stability)
-    safe = "".join(c for c in safe if c.isascii() and (c.isalnum() or c in ("-", "_", ".")))
-    return safe if safe else "file.dxf"
-
-
-def _make_batch_id() -> str:
-    """Generate time-sortable batch ID"""
-    ts = now_seoul_iso().replace(":", "").replace("-", "").replace("+0900", "").replace("T", "_")
-    ts = ts.split(".")[0].replace("+09:00", "").replace("+0900", "")
-    return f"{ts}_{uuid.uuid4().hex[:8]}"
-
-
-# =========================
-
-
-def _parse_iso_dt(s: str):
-    """Parse ISO datetime from worker heartbeat. Accepts 'Z' suffix."""
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s)
+        results = drive.files().list(q=query, fields="files(id,name,size)").execute()
+        files = results.get("files", [])
+        return files[0] if files else None
     except Exception:
         return None
 
 
-def list_worker_heartbeats(drive, meta_folder_id: str, ttl_sec: int = 30):
-    """
-    Returns:
-      active_workers: list[dict] (updated within ttl_sec)
-      last_seen: datetime (most recent heartbeat regardless of ttl), or None
-    Notes:
-      Uses local datetime module alias to avoid import-name collisions.
-    """
-    import datetime as _dt
-
-    def _parse_iso_dt(s: str):
-        if not s:
-            return None
-        try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            return _dt.datetime.fromisoformat(s)
-        except Exception:
-            return None
-
-    # META에서 __worker__*.json 찾기 (Drive query의 name contains가 환경에 따라 누락되는 경우가 있어 전체 목록 후 필터링)
-    res = drive.files().list(
-        q=f"'{meta_folder_id}' in parents and trashed=false",
-        fields="files(id,name)",
-        orderBy="modifiedTime desc",
-        pageSize=200,
-    ).execute()
-    files = [f for f in res.get("files", []) if (f.get("name","").startswith("__worker__") and f.get("name","").lower().endswith(".json"))]
-
-
-    now = _dt.datetime.now(_dt.timezone.utc)
-
-    active = []
-    last_seen = None
-
-    for f in files:
-        try:
-            hb = download_json(drive, f["id"])  # 기존 함수 재사용
-            updated_at = hb.get("updated_at")
-            hb_time = _parse_iso_dt(updated_at)
-            if hb_time is None:
-                continue
-            if hb_time.tzinfo is None:
-                hb_time = hb_time.replace(tzinfo=_dt.timezone.utc)
-
-            # last_seen 갱신
-            if last_seen is None or hb_time > last_seen:
-                last_seen = hb_time
-
-            age = (now - hb_time).total_seconds()
-            if age <= ttl_sec:
-                hb["_hb_time"] = hb_time  # 정렬/표시에 사용(내부용)
-                active.append(hb)
-        except Exception:
-            continue
-
-    # 최근 업데이트 우선 정렬
-    active.sort(key=lambda x: x.get("_hb_time") or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc), reverse=True)
-    return active, last_seen
-
-
-#     active = []
-#     for f in files:
-#         try:
-#             meta = download_json(drive, f["id"])
-#             if job_meta.get("type") != "worker_heartbeat":
-#                 continue
-#             updated_at = job_meta.get("updated_at")
-#             if not updated_at:
-#                 continue
-#             # Python 3.9: fromisoformat handles '+09:00' offsets
-#             dt = _dt.datetime.fromisoformat(updated_at)
-#             if dt.tzinfo is None:
-#                 dt = dt.replace(tzinfo=_dt.timezone.utc)
-#             age = (now - dt.astimezone(_dt.timezone.utc)).total_seconds()
-#             if age <= ttl_sec:
-#                 active.append((age, meta))
-#         except Exception:
-#             continue
-
-#     # sort by worker_id for stable ordering (not by age)
-#     active.sort(key=lambda x: (x[1].get("worker_id") or "", x[0]))
-#     return [m for _, m in active]
-
-
-# UI
 # =========================
-st.set_page_config(page_title="DXF Client", layout="centered")
+# RTDB Helpers
+# =========================
+def create_job(ref, file_id: str, filename: str, priority: int = 50):
+    """Create a new job in Firebase RTDB"""
+    timestamp = datetime.now(SEOUL_TZ).strftime("%Y%m%d_%H%M%S")
+    short_id = uuid.uuid4().hex[:8]
+    safe_name = filename.replace(" ", "_").replace(".", "_")[:40]
+    
+    job_id = f"job_{timestamp}_{short_id}_{safe_name}"
+    
+    priority_pad = str(priority).zfill(4)
+    now_ms = int(datetime.now().timestamp() * 1000)
+    
+    job_data = {
+        "status": "queued",
+        "statusKey": f"queued|{priority_pad}",
+        "priority": priority,
+        "createdAt": now_ms,
+        "updatedAt": now_ms,
+        
+        "ownerUid": "streamlit_client",
+        "workerUid": None,
+        "claimedAt": None,
+        "leaseUntil": None,
+        
+        "source": {
+            "type": "gdrive",
+            "fileId": file_id,
+            "fileName": filename,
+            "langFrom": "ru",
+            "langTo": "en"
+        },
+        
+        "result": {
+            "outputFileId": None,
+            "outputFileName": None
+        },
+        
+        "error": {
+            "code": None,
+            "message": None
+        }
+    }
+    
+    jobs_ref = ref.child(f"jobs/{job_id}")
+    jobs_ref.set(job_data)
+    
+    return job_id
 
-# Google Analytics
-st.components.v1.html(
-    """
-    <!-- Google tag (gtag.js) -->
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-E1LFDTNPVP"></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag(){dataLayer.push(arguments);}
-      gtag('js', new Date());
-      gtag('config', 'G-E1LFDTNPVP');
-    </script>
-    """,
-    height=0,
+
+def get_job_status(ref, job_id: str):
+    """Get job status from RTDB"""
+    job_ref = ref.child(f"jobs/{job_id}")
+    return job_ref.get()
+
+
+def get_all_jobs(ref, limit: int = 50):
+    """Get all jobs ordered by creation time"""
+    jobs_ref = ref.child("jobs")
+    jobs = jobs_ref.order_by_child("createdAt").limit_to_last(limit).get()
+    
+    if not jobs:
+        return []
+    
+    # Convert to list and sort by createdAt (newest first)
+    job_list = [{"id": k, **v} for k, v in jobs.items()]
+    job_list.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
+    
+    return job_list
+
+
+def get_worker_heartbeats(ref):
+    """Get all worker heartbeats"""
+    heartbeat_ref = ref.child("workerHeartbeat")
+    return heartbeat_ref.get() or {}
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(
+    page_title="DXF Translation",
+    page_icon="🔧",
+    layout="wide"
 )
 
-st.title("DXF Translation Client")
+st.title("🔧 DXF Translation System")
+st.caption("Russian → English DXF File Translator (Firebase RTDB)")
 
-with st.expander("About", expanded=False):
-    st.markdown(
-        """
-- This app uploads DXF files to a Google Drive shared folder
-- A local worker translates them and uploads results to `DONE/`
-- The app detects completion and provides a download button
-        """
-    )
-
-# Drive connection
+# Initialize services
 try:
+    rtdb_ref = init_firebase()
     drive = get_drive_service()
-    folders = get_subfolder_ids(drive)
+    st.success("✅ Connected to Firebase RTDB and Google Drive")
 except Exception as e:
-    st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
-    st.exception(e)
+    st.error(f"❌ Failed to initialize services: {e}")
     st.stop()
 
-st.success("✅ Connected to Google Drive")
+# =========================
+# Sidebar: Worker Status
+# =========================
+st.sidebar.header("🤖 Worker Status")
 
-# Sidebar controls
-st.sidebar.header("Options")
-auto_refresh = st.sidebar.checkbox("Auto-refresh status", value=True)
-refresh_sec = st.sidebar.slider("Refresh interval (sec)", 3, 30, 5)
+workers = get_worker_heartbeats(rtdb_ref)
+now_ms = int(datetime.now().timestamp() * 1000)
 
-
-# Worker heartbeat timeout (sec)
-HEARTBEAT_TIMEOUT = 30  # worker is considered alive if heartbeat within this window
-
-st.sidebar.divider()
-st.sidebar.subheader("Worker status")
-active_workers, last_seen = list_worker_heartbeats(drive, folders["META"], ttl_sec=HEARTBEAT_TIMEOUT)
-
-# --- Debug/Status variables (used by Developer Debug Panel) ---
-worker_heartbeat_raw = active_workers[0] if active_workers else {}
-heartbeat_ts = (last_seen.isoformat(timespec="seconds") if last_seen is not None else None)
-now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-diff_sec = None
-is_worker_alive = False
-if last_seen is not None:
-    try:
-        diff_sec = (datetime.now(timezone.utc) - last_seen.astimezone(timezone.utc)).total_seconds()
-        is_worker_alive = diff_sec <= HEARTBEAT_TIMEOUT
-    except Exception:
-        pass
-
-if not active_workers:
-    st.sidebar.markdown("🔴 **작업워커 없음**")
-    if last_seen is not None:
-        try:
-            last_seen_local = last_seen.astimezone()
-        except Exception:
-            last_seen_local = last_seen
-        st.sidebar.caption(f"마지막 접속: {last_seen_local.strftime('%Y-%m-%d %H:%M:%S')}")
+if workers:
+    active_workers = []
+    idle_workers = []
+    
+    for worker_id, data in workers.items():
+        last_seen = data.get("lastSeen", 0)
+        diff_sec = (now_ms - last_seen) / 1000
+        
+        if diff_sec < 10:
+            active_workers.append((worker_id, data, diff_sec))
+        elif diff_sec < 30:
+            idle_workers.append((worker_id, data, diff_sec))
+    
+    # Active workers (green)
+    if active_workers:
+        st.sidebar.success(f"🟢 Active Workers: {len(active_workers)}")
+        for worker_id, data, diff_sec in active_workers:
+            host = data.get("host", "Unknown")
+            st.sidebar.caption(f"• {host} ({int(diff_sec)}s ago)")
+    
+    # Idle workers (yellow)
+    if idle_workers:
+        st.sidebar.warning(f"🟡 Idle Workers: {len(idle_workers)}")
+        for worker_id, data, diff_sec in idle_workers:
+            host = data.get("host", "Unknown")
+            st.sidebar.caption(f"• {host} ({int(diff_sec)}s ago)")
+    
+    # No active workers
+    if not active_workers and not idle_workers:
+        st.sidebar.error("⚠️ No active workers")
 else:
-    # 여러 워커를 최근 heartbeat 순으로 표시
-    for idx, hb in enumerate(active_workers, start=1):
-        stt = (hb.get("status") or "").lower()
-        if stt == "busy":
-            st.sidebar.markdown(f"🟡 **{idx}번워커 번역중**")
-            cj = hb.get("current_job_id")
-            if cj:
-                st.sidebar.caption(f"job: {cj}")
-        else:
-            st.sidebar.markdown(f"🟢 **{idx}번워커 대기중**")
-        # 필요하면 worker_id를 아래에 표시(너무 길면 숨김 가능)
-        wid = hb.get("worker_id")
-        if wid:
-            st.sidebar.caption(wid)
+    st.sidebar.error("⚠️ No workers found")
 
-uploaded_list = st.file_uploader(
-    "Select DXF files (multiple allowed)",
-    type=["dxf", "DXF"],
-    accept_multiple_files=True,
-)
+st.sidebar.markdown("---")
 
-if uploaded_list:
-    total_files = len(uploaded_list)
-    total_size = sum(u.size for u in uploaded_list)
-
-    st.write(f"Selected files: **{total_files}** / Total size: **{total_size/1024/1024:.1f} MB**")
-    too_big = [u for u in uploaded_list if u.size > MAX_FILE_BYTES]
-
-    if too_big:
-                st.error(
-            f"The following files are too large. Maximum size is {MAX_FILE_MB}MB:\n- "
-            + "\n- ".join([f"{u.name} ({u.size/1024/1024:.1f}MB)" for u in too_big])
-        )
-    else:
-        # Batch upload button
-        if st.button("Batch Upload to INBOX", type="primary"):
-            st.session_state.pop("upload_progress", None)
-
-            batch_id = _make_batch_id()
-            created_at = now_seoul_iso()
-
-            manifest_filename = f"{batch_id}__manifest.json"
-            manifest_payload = {
-                "batch_id": batch_id,
-                "status": "uploading",
-                "created_at": created_at,
-                "updated_at": created_at,
-                "total": total_files,
-                "items": [],
-                "message": "Uploading files to INBOX and writing META items."
-            }
-
-            progress = st.progress(0)
-            status_box = st.empty()
-
-            ok_count = 0
-            errors = []
-
-            with st.spinner("Uploading..."):
-                for idx, uploaded in enumerate(uploaded_list, 1):
-                    try:
-                        safe_orig = _safe_name(uploaded.name)
-                        # Streamlit's UploadedFile is a file-like object.
-                        # Avoid .getvalue() to prevent large in-memory copies.
-                        file_obj = uploaded
-                        try:
-                            file_obj.seek(0)
-                        except Exception:
-                            pass
-
-                        job_id = make_job_id(safe_orig)
-
-                        inbox_name = f"{job_id}__{safe_orig}"
-                        meta_filename = f"{job_id}.json"
-
-                        meta_payload = {
-                            "batch_id": batch_id,
-                            "job_id": job_id,
-                            "original_name": safe_orig,
-                            "inbox_name": inbox_name,
-                            "status": "queued",
-                            "created_at": created_at,
-                            "updated_at": now_seoul_iso(),
-                            "progress": 0,
-                            "message": "Uploaded to INBOX. Waiting for local worker.",
-                            "done_file": None,
-                            "error": None,
-                        }
-
-                        # 1) Upload DXF to INBOX
-                        resp = upload_file_to_folder(
-                            drive,
-                            folders["INBOX"],
-                            inbox_name,
-                            file_obj,
-                            mime=getattr(uploaded, "type", None) or "application/dxf"
-                        )
-                        meta_payload["inbox_file_id"] = resp.get("id")
-                        meta_payload["progress"] = 5
-                        meta_payload["updated_at"] = now_seoul_iso()
-
-                        # 2) Upsert META
-                        upsert_json_file(drive, folders["META"], meta_filename, meta_payload)
-
-                        # 3) Add to manifest
-                        manifest_payload["items"].append({
-                            "job_id": job_id,
-                            "meta_filename": meta_filename,
-                            "original_name": safe_orig,
-                            "inbox_name": inbox_name,
-                            "inbox_file_id": meta_payload.get("inbox_file_id"),
-                            "status": "queued",
-                        })
-
-                        ok_count += 1
-
-                    except Exception as e:
-                        errors.append({"file": uploaded.name, "error": str(e)})
-
-                    # UI progress update
-                    pct = int((idx / total_files) * 100)
-                    progress.progress(pct)
-                    status_box.write(f"Upload progress: {idx}/{total_files} (success {ok_count} / failed {len(errors)})")
-
-            # Finalize manifest
-            manifest_payload["updated_at"] = now_seoul_iso()
-            if errors:
-                manifest_payload["status"] = "error"
-                manifest_payload["message"] = f"Uploaded with errors: {len(errors)} failed."
-                manifest_payload["errors"] = errors
-            else:
-                manifest_payload["status"] = "queued"
-                manifest_payload["message"] = "All files uploaded. Waiting for local worker."
-
-            # Write manifest
-            try:
-                upsert_json_file(drive, folders["META"], manifest_filename, manifest_payload)
-            except Exception as e:
-                st.error("❌ Failed to save manifest")
-                st.exception(e)
-
-            # Store batch context
-            st.session_state["active_batch_id"] = batch_id
-            st.session_state["active_job_ids"] = [it["job_id"] for it in manifest_payload["items"]]
-
-            if errors:
-                st.warning(f"⚠️ Some uploads failed: {len(errors)} files")
-                st.json(errors)
-            st.success("✅ Batch upload completed")
-            st.code(f"batch_id: {batch_id}")
-
-
-st.subheader("2) Job Status / Download")
-
-# Load recent jobs
-recent = list_recent_jobs(drive, folders["META"], limit=30)
-recent_ids = [f["name"].replace(".json", "") for f in recent]
-
-default_job = st.session_state.get("active_job_id")
-if default_job and default_job in recent_ids:
-    default_index = recent_ids.index(default_job)
-else:
-    default_index = 0 if recent_ids else None
-
-job_id = None
-if recent_ids:
-    job_id = st.selectbox("Select recent job", recent_ids, index=default_index)
-else:
-    st.info("No jobs in META folder yet. Upload files first.")
-
-# Auto refresh
-def do_autorefresh():
-    try:
-        from streamlit import st_autorefresh
-        st_autorefresh(interval=refresh_sec * 1000, key="job_poll")
-    except Exception:
-        pass
+# Auto-refresh settings
+st.sidebar.subheader("⚙️ Settings")
+auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
+refresh_interval = st.sidebar.slider("Refresh interval (sec)", 2, 10, 3)
 
 if auto_refresh:
-    do_autorefresh()
+    time.sleep(refresh_interval)
+    st.rerun()
 
-col_a, col_b = st.columns([1, 1])
-with col_a:
-    manual_refresh = st.button("Refresh Status")
-with col_b:
-    st.caption("Use button if auto-refresh doesn't work")
+# =========================
+# Main Content: 3 Tabs
+# =========================
+tab_upload, tab_monitor, tab_stats = st.tabs(["📤 Upload", "📊 Monitor Jobs", "📈 Statistics"])
 
-if job_id:
-    job_meta_name = f"{job_id}.json"
-    try:
-        job_meta = read_json_file_by_name(drive, folders["META"], job_meta_name)
-    except Exception as e:
-        st.error(f"Failed to read META\n\n{type(e).__name__}: {e}")
-        job_meta = None
+# =========================
+# Tab 1: Upload
+# =========================
+with tab_upload:
+    st.header("Upload DXF Files")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        uploaded_files = st.file_uploader(
+            "Choose DXF file(s)",
+            type=["dxf"],
+            accept_multiple_files=True,
+            help=f"Max {MAX_FILE_MB}MB per file"
+        )
+    
+    with col2:
+        priority = st.selectbox(
+            "Priority",
+            options=[25, 50, 100, 200],
+            index=1,
+            format_func=lambda x: {
+                200: "🔴 Urgent (200)",
+                100: "🟡 High (100)",
+                50: "🟢 Normal (50)",
+                25: "⚪ Low (25)"
+            }[x]
+        )
+    
+    if uploaded_files:
+        st.info(f"📋 {len(uploaded_files)} file(s) selected")
+        
+        # Preview
+        with st.expander("Preview selected files"):
+            for f in uploaded_files:
+                size_mb = len(f.getvalue()) / 1024 / 1024
+                st.write(f"• {f.name} ({size_mb:.2f} MB)")
+        
+        if st.button("🚀 Upload & Start Translation", type="primary", use_container_width=True):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            success_count = 0
+            failed_files = []
+            created_jobs = []
+            
+            for idx, uploaded_file in enumerate(uploaded_files):
+                try:
+                    # Validate file size
+                    file_size = len(uploaded_file.getvalue())
+                    if file_size > MAX_FILE_BYTES:
+                        raise ValueError(f"File too large: {file_size / 1024 / 1024:.1f}MB > {MAX_FILE_MB}MB")
+                    
+                    status_text.text(f"Uploading {uploaded_file.name}... ({idx + 1}/{len(uploaded_files)})")
+                    
+                    # Upload to Drive
+                    result = upload_file_to_drive(
+                        drive,
+                        INBOX_FOLDER_ID,
+                        uploaded_file.name,
+                        uploaded_file,
+                        mime=uploaded_file.type or "application/dxf"
+                    )
+                    
+                    file_id = result["id"]
+                    
+                    # Create job in RTDB
+                    job_id = create_job(rtdb_ref, file_id, uploaded_file.name, priority)
+                    created_jobs.append((job_id, uploaded_file.name))
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    failed_files.append((uploaded_file.name, str(e)))
+                
+                # Update progress
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Summary
+            st.success(f"✅ Successfully uploaded: {success_count}/{len(uploaded_files)}")
+            
+            if created_jobs:
+                with st.expander("Created jobs"):
+                    for job_id, filename in created_jobs:
+                        st.code(f"{filename} → {job_id}")
+                
+                # Store first job for monitoring
+                if created_jobs:
+                    st.session_state["last_job_id"] = created_jobs[0][0]
+            
+            if failed_files:
+                st.error(f"❌ Failed: {len(failed_files)}")
+                with st.expander("Failed files"):
+                    for filename, error in failed_files:
+                        st.write(f"• {filename}: {error}")
 
-
-    if job_meta:
-        st.write(f"**status:** `{job_meta.get('status')}`")
-        st.write(f"**updated_at:** `{job_meta.get('updated_at')}`")
-        st.write(f"**message:** {job_meta.get('message')}")
-        prog = int(job_meta.get("progress", 0) or 0)
-        st.progress(min(max(prog, 0), 100) / 100.0)
-
-        if job_meta.get("status") == "error":
-            st.error("Job failed")
-            if job_meta.get("error"):
-                st.code(job_meta.get("error"))
-
-        if job_meta.get("status") == "done":
-            done_file = job_meta.get("done_file")
-            if not done_file:
-                st.warning("Status is 'done' but done_file is missing in META")
-            else:
-                st.success("✅ Translation completed")
-                st.write(f"Result file: `{done_file}`")
-
-                done_obj = find_file_in_folder_by_name(drive, folders["DONE"], done_file)
-                if not done_obj:
-                    st.warning("Result file not found in DONE folder yet. Please try again later.")
-                else:
-                    try:
-                        with st.spinner("Preparing download... (may take time for large files)"):
-                            data = download_file_bytes(drive, done_obj["id"])
-
-                        st.download_button(
-                            label="Download Result DXF",
-                            data=data,
-                            file_name=done_file,
-                            mime="application/dxf",
-                            type="primary",
-                        )
-                    except Exception as e:
-                        st.error("Failed to prepare download")
-                        st.exception(e)
-
+# =========================
+# Tab 2: Monitor Jobs
+# =========================
+with tab_monitor:
+    st.header("Job Monitoring")
+    
+    # Get all jobs
+    all_jobs = get_all_jobs(rtdb_ref, limit=50)
+    
+    if not all_jobs:
+        st.info("No jobs yet. Upload files to get started.")
     else:
-        st.info("META file not found for this job yet")
+        # Filter options
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            filter_status = st.multiselect(
+                "Filter by status",
+                options=["queued", "working", "done", "error"],
+                default=["queued", "working"]
+            )
+        
+        with col2:
+            if st.button("🔄 Refresh"):
+                st.rerun()
+        
+        # Filter jobs
+        filtered_jobs = [j for j in all_jobs if j.get("status") in filter_status] if filter_status else all_jobs
+        
+        st.caption(f"Showing {len(filtered_jobs)} of {len(all_jobs)} jobs")
+        
+        # Display jobs
+        for job in filtered_jobs:
+            job_id = job["id"]
+            status = job.get("status", "unknown")
+            filename = job.get("source", {}).get("fileName", "Unknown")
+            priority = job.get("priority", 0)
+            progress = job.get("progress", 0)
+            created_at = datetime.fromtimestamp(job.get("createdAt", 0) / 1000, SEOUL_TZ)
+            
+            # Status badge
+            status_emoji = {
+                "queued": "⏳",
+                "working": "🔄",
+                "done": "✅",
+                "error": "❌"
+            }.get(status, "❓")
+            
+            status_color = {
+                "queued": "🟡",
+                "working": "🔵",
+                "done": "🟢",
+                "error": "🔴"
+            }.get(status, "⚪")
+            
+            with st.expander(f"{status_emoji} {filename} - {status.upper()} (Priority: {priority})"):
+                col_info, col_action = st.columns([3, 1])
+                
+                with col_info:
+                    st.write(f"**Job ID:** `{job_id}`")
+                    st.write(f"**Created:** {created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                    st.write(f"**Status:** {status_color} {status.upper()}")
+                    
+                    if status == "working":
+                        worker = job.get("workerUid", "Unknown")
+                        message = job.get("progressMessage", "Processing...")
+                        st.write(f"**Worker:** {worker}")
+                        st.write(f"**Progress:** {progress}%")
+                        st.progress(progress / 100.0)
+                        st.caption(message)
+                    
+                    if status == "error":
+                        error = job.get("error", {})
+                        st.error(f"Error: {error.get('message', 'Unknown error')}")
+                    
+                    if status == "done":
+                        result = job.get("result", {})
+                        output_filename = result.get("outputFileName")
+                        output_file_id = result.get("outputFileId")
+                        
+                        if output_filename and output_file_id:
+                            st.success(f"✅ Translation completed")
+                            st.write(f"**Output:** {output_filename}")
+                
+                with col_action:
+                    if status == "done":
+                        result = job.get("result", {})
+                        output_file_id = result.get("outputFileId")
+                        output_filename = result.get("outputFileName")
+                        
+                        if output_file_id and output_filename:
+                            if st.button("📥 Download", key=f"download_{job_id}"):
+                                with st.spinner("Downloading..."):
+                                    try:
+                                        file_data = download_file_from_drive(drive, output_file_id)
+                                        
+                                        st.download_button(
+                                            label="💾 Save File",
+                                            data=file_data,
+                                            file_name=output_filename,
+                                            mime="application/dxf",
+                                            key=f"save_{job_id}"
+                                        )
+                                    except Exception as e:
+                                        st.error(f"Download failed: {e}")
 
-# ==================================================
-# 🔧 Developer Debug Panel (DEV ONLY)
-# ==================================================
-
-DEV_MODE = True  # 나중에 False / env / secrets로 전환
-
-if DEV_MODE:
+# =========================
+# Tab 3: Statistics
+# =========================
+with tab_stats:
+    st.header("System Statistics")
+    
+    all_jobs = get_all_jobs(rtdb_ref, limit=100)
+    
+    # Count by status
+    status_counts = {"queued": 0, "working": 0, "done": 0, "error": 0}
+    for job in all_jobs:
+        status = job.get("status", "unknown")
+        if status in status_counts:
+            status_counts[status] += 1
+    
+    # Display stats
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("⏳ Queued", status_counts["queued"])
+    
+    with col2:
+        st.metric("🔄 Working", status_counts["working"])
+    
+    with col3:
+        st.metric("✅ Done", status_counts["done"])
+    
+    with col4:
+        st.metric("❌ Error", status_counts["error"])
+    
     st.markdown("---")
-    with st.expander("🔧 Developer Debug Panel", expanded=False):
+    
+    # Recent activity
+    st.subheader("Recent Activity")
+    
+    if all_jobs:
+        recent_5 = all_jobs[:5]
+        
+        for job in recent_5:
+            filename = job.get("source", {}).get("fileName", "Unknown")
+            status = job.get("status", "unknown")
+            created_at = datetime.fromtimestamp(job.get("createdAt", 0) / 1000, SEOUL_TZ)
+            
+            status_emoji = {
+                "queued": "⏳",
+                "working": "🔄",
+                "done": "✅",
+                "error": "❌"
+            }.get(status, "❓")
+            
+            st.write(f"{status_emoji} **{filename}** - {status} ({created_at.strftime('%H:%M:%S')})")
+    else:
+        st.info("No jobs yet")
 
-        st.subheader("🫀 Worker Heartbeat Raw")
-        st.json(worker_heartbeat_raw or {})
-
-        st.subheader("🚦 Worker Alive Check")
-        st.write({
-            "now_iso": now_iso,
-            "heartbeat_ts": heartbeat_ts,
-            "diff_sec": diff_sec,
-            "alive_threshold_sec": HEARTBEAT_TIMEOUT,
-            "is_worker_alive": is_worker_alive,
-        })
-
-        st.subheader("📦 Job Meta Raw")
-        st.json(job_meta or {})
+# =========================
+# Footer
+# =========================
+st.markdown("---")
+st.caption("DXF Translation System v2.0 (Firebase RTDB) | Made with Streamlit")
