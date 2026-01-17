@@ -83,76 +83,43 @@ def make_batch_id() -> str:
 # Firebase (RTDB)
 # =========================
 @st.cache_resource(show_spinner=False)
-def init_firebase():
-    if not st.secrets.get("firebase"):
-        raise RuntimeError("Missing [firebase] in Streamlit Secrets")
+def init_firebase_rtdb():
+    """
+    Initialize Firebase Admin SDK for RTDB using base64-encoded service account JSON
+    stored in Streamlit Secrets.
 
-    f = st.secrets["firebase"]
-    database_url = f.get("database_url")
+    Required secrets:
+      [firebase]
+      database_url = "https://....firebaseio.com" or "...firebasedatabase.app"
+      service_account_b64 = "base64(JSON)"
+    """
+    fb = st.secrets.get("firebase")
+    if not fb:
+        raise RuntimeError("Missing [firebase] section in Streamlit Secrets")
+
+    database_url = fb.get("database_url")
     if not database_url:
         raise RuntimeError("Missing firebase.database_url")
 
-    def _sanitize_json_text(txt: str) -> str:
-        # 1) 흔한 “스마트 따옴표”를 일반 따옴표로 교정
-        txt = txt.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    sa_b64 = fb.get("service_account_b64")
+    if not sa_b64:
+        raise RuntimeError("Missing firebase.service_account_b64")
 
-        # 2) BOM 제거
-        txt = txt.lstrip("\ufeff").strip()
+    # Be tolerant to accidental whitespace/newlines in Secrets
+    sa_b64_clean = "".join(str(sa_b64).split())
 
-        # 3) private_key 값 안에 "실제 줄바꿈"이 들어가 있으면 JSON이 깨지므로 \\n으로 치환
-        #    "private_key": "-----BEGIN...<여기 줄바꿈들>...END..."\n
-        #    를 안전하게 한 줄 문자열로 복원
-        pattern = r'("private_key"\s*:\s*")(.+?)(")'
-        m = re.search(pattern, txt, flags=re.DOTALL)
-        if m:
-            pk = m.group(2)
-            # JSON 문자열 내부에 들어가면 안 되는 실제 개행을 \\n으로 바꾼다
-            pk = pk.replace("\r\n", "\n").replace("\r", "\n")
-            pk = pk.replace("\n", "\\n")
-            txt = txt[: m.start(2)] + pk + txt[m.end(2) :]
-
-        return txt
-
-    def _load_service_account_dict() -> dict:
-        # A) service_account_json이 dict로 들어온 경우(Secrets를 TOML 테이블로 넣었을 때)
-        sa_obj = f.get("service_account_json")
-        if isinstance(sa_obj, dict):
-            return sa_obj
-
-        # B) service_account_json이 문자열로 들어온 경우(가장 흔함)
-        if isinstance(sa_obj, str) and sa_obj.strip():
-            raw = _sanitize_json_text(sa_obj)
-            try:
-                return json.loads(raw)
-            except Exception as e:
-                # 디버깅에 도움이 되도록 “앞부분만” 힌트를 주되 비밀은 노출하지 않음
-                hint = raw[:120].replace("\n", "\\n")
-                raise RuntimeError(
-                    "firebase.service_account_json is not valid JSON (check quotes/newlines). "
-                    f"Preview: {hint}..."
-                ) from e
-
-        # C) fallback: base64
-        sa_b64 = f.get("service_account_b64")
-        if isinstance(sa_b64, str) and sa_b64.strip():
-            try:
-                decoded = base64.b64decode(sa_b64).decode("utf-8")
-                decoded = _sanitize_json_text(decoded)
-                return json.loads(decoded)
-            except Exception as e:
-                raise RuntimeError("firebase.service_account_b64 could not be decoded as JSON") from e
-
-        raise RuntimeError(
-            'Missing firebase.service_account_json (recommended) or firebase.service_account_b64'
-        )
-
-    sa_dict = _load_service_account_dict()
+    try:
+        decoded = base64.b64decode(sa_b64_clean).decode("utf-8")
+        sa_dict = json.loads(decoded)
+    except Exception as e:
+        raise RuntimeError("firebase.service_account_b64 could not be decoded as valid JSON") from e
 
     if sa_dict.get("type") != "service_account":
-        raise RuntimeError('Invalid service account JSON: `"type"` must be `"service_account"`')
+        raise RuntimeError('Invalid service account JSON: "type" must be "service_account"')
 
     cred_obj = credentials.Certificate(sa_dict)
 
+    # Avoid duplicate init on Streamlit reruns
     if not firebase_admin._apps:
         firebase_admin.initialize_app(cred_obj, {"databaseURL": database_url})
 
