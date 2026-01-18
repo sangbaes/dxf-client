@@ -1,91 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DXF Translation Client (English Version)
-========================================
-Streamlit app for uploading DXF files and monitoring translation jobs
+DXF Minimal Client (Streamlit)
+- Upload DXF to Google Drive INBOX
+- Create job in Firebase RTDB (queued)
+- Poll job status from RTDB
+- Download translated DXF from Google Drive OUTBOX when done
+
+Secrets required (Streamlit Cloud -> Settings -> Secrets):
+[gcp_service_account]
+... (service account json fields)
+
+[drive]
+DXF_INBOX_FOLDER_ID="..."
+DXF_OUTBOX_FOLDER_ID="..."
+
+[rtdb]
+url="https://<YOUR_DB>.firebaseio.com"
 """
-import base64
-import json
+
+import io
 import time
 import uuid
-from pathlib import Path
-from google.oauth2 import service_account
-from io import BytesIO
-import re
 from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List
 
 import streamlit as st
+
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-import socket
-import ssl
-import httplib2
-from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.errors import HttpError
-import time
-import random
-import ssl
 
-TRANSIENT_EXC_NAMES = {
-    "SSLError",
-    "HttpLib2Error",
-    "ServerNotFoundError",
-    "TimeoutError",
-    "ConnectionError",
-}
-
-def _is_transient_exc(e: Exception) -> bool:
-    name = type(e).__name__
-    if name in TRANSIENT_EXC_NAMES:
-        return True
-    # ssl.SSLError subclasses show up as SSLError too, but keep fallback by message
-    msg = str(e).lower()
-    if "decryption_failed_or_bad_record_mac" in msg:
-        return True
-    if "bad record mac" in msg:
-        return True
-    if "tls" in msg and "error" in msg:
-        return True
-    return False
-
-def _with_retry(fn, *, tries: int = 5, base_sleep: float = 0.6, max_sleep: float = 6.0, what: str = "operation"):
-    """Retry transient network/SSL errors with exponential backoff + jitter."""
-    last = None
-    for attempt in range(1, tries + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if not _is_transient_exc(e) or attempt == tries:
-                raise
-            sleep = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
-            sleep *= (0.7 + random.random() * 0.6)  # jitter 0.7~1.3
-            try:
-                st.warning(f"⚠️ {what} 중 일시적 네트워크 오류 발생. 재시도 {attempt}/{tries} ...")
-            except Exception:
-                pass
-            time.sleep(sleep)
-    raise last
+import firebase_admin
+from firebase_admin import credentials, db
 
 
-# =========================
+# -----------------------------
 # Config
-# =========================
-DXF_SHARED_FOLDER_ID = "1qhx_xTGdOusxhV0xN2df4Kc8JTfh3zTd"
-
-SUBFOLDERS = ["INBOX", "WORKING", "DONE", "META"]
+# -----------------------------
+APP_TITLE = "DXF Client (Minimal)"
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 MAX_FILE_MB = 200
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
 SEOUL_TZ = timezone(timedelta(hours=9))
+JOBS_PATH = "jobs"  # RTDB path root
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-
-# =========================
-# Helpers
-# =========================
+# -----------------------------
+# Time / Job helpers
+# -----------------------------
 def now_seoul_iso() -> str:
     return datetime.now(SEOUL_TZ).isoformat(timespec="seconds")
 
@@ -93,204 +58,250 @@ def now_seoul_iso() -> str:
 def make_job_id(original_name: str) -> str:
     ts = datetime.now(SEOUL_TZ).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
-    # Remove spaces and keep only safe ASCII characters for Drive filenames.
-    # Some environments/HTTP stacks are surprisingly fragile with non-ASCII names.
-    base = original_name.replace(" ", "")
+    base = (original_name or "file").replace(" ", "")
     safe = "".join(c for c in base if c.isascii() and (c.isalnum() or c in ("-", "_", ".")))
-    safe = safe[:40] if safe else "file"
+    safe = safe[:50] if safe else "file.dxf"
     return f"{ts}_{short}_{safe}"
 
 
-def drive_execute(req, retries: int = 5, base_sleep: float = 0.6):
-    """Execute Drive API request with retry logic for network stability"""
-    last_err = None
-    for i in range(retries + 1):
-        try:
-            return req.execute(num_retries=1)
-        except (HttpError, OSError, ssl.SSLError, socket.timeout) as e:
-            last_err = e
-            if i >= retries:
-                raise
-            time.sleep(base_sleep * (2 ** i))
-    raise last_err
-
-
-def load_service_account_info():
-    # Base64 method (Streamlit Secrets: SERVICE_ACCOUNT_B64)
-    if "SERVICE_ACCOUNT_B64" not in st.secrets:
-        raise RuntimeError("SERVICE_ACCOUNT_B64 not found in Streamlit Secrets")
-
-    raw = base64.b64decode(st.secrets["SERVICE_ACCOUNT_B64"].encode("ascii"))
-    info = json.loads(raw.decode("utf-8"))
-
-    # Fix escaped newlines in private_key
+# -----------------------------
+# Secrets / Clients
+# -----------------------------
+def _get_sa_info() -> Dict[str, Any]:
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Missing [gcp_service_account] in Streamlit Secrets.")
+    info = dict(st.secrets["gcp_service_account"])
     if "private_key" in info and isinstance(info["private_key"], str):
         info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
-
     return info
 
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+def _get_drive_folder_ids() -> Dict[str, str]:
+    if "drive" not in st.secrets:
+        raise RuntimeError("Missing [drive] in Streamlit Secrets.")
+    inbox = st.secrets["drive"].get("DXF_INBOX_FOLDER_ID", "").strip()
+    outbox = st.secrets["drive"].get("DXF_OUTBOX_FOLDER_ID", "").strip()
+    if not inbox or not outbox:
+        raise RuntimeError("Missing drive folder IDs. Need DXF_INBOX_FOLDER_ID and DXF_OUTBOX_FOLDER_ID.")
+    return {"INBOX": inbox, "OUTBOX": outbox}
 
 
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
-    # 1) Streamlit Secrets에 gcp_service_account로 넣은 경우 (권장)
-    if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-        # private_key 줄바꿈 보정
-        if "private_key" in info and isinstance(info["private_key"], str):
-            info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-    # 2) 예전 방식: SERVICE_ACCOUNT_B64로 넣은 경우도 지원 (호환용)
-    elif "SERVICE_ACCOUNT_B64" in st.secrets:
-        info = load_service_account_info()
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-    else:
-        raise RuntimeError(
-            "Service Account secrets not found. "
-            "Add [gcp_service_account] (recommended) or SERVICE_ACCOUNT_B64 to Streamlit Secrets."
-        )
-
-    # Streamlit Cloud에서 안정성을 위해 timeout 지정
-    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
-    return build("drive", "v3", http=authed_http, cache_discovery=False)
+    info = _get_sa_info()
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def find_or_create_folder(drive, parent_id: str, name: str) -> str:
-    q = (
-        f"'{parent_id}' in parents and "
-        f"name = '{name}' and "
-        "mimeType = 'application/vnd.google-apps.folder' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name)").execute(num_retries=3)
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"]
-
-    metadata = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    folder = drive.files().create(body=metadata, fields="id").execute()
-    return folder["id"]
+@st.cache_resource(show_spinner=False)
+def init_rtdb():
+    if "rtdb" not in st.secrets or "url" not in st.secrets["rtdb"]:
+        raise RuntimeError("Missing [rtdb].url in Streamlit Secrets.")
+    if not firebase_admin._apps:
+        info = _get_sa_info()
+        cred = credentials.Certificate(info)
+        firebase_admin.initialize_app(cred, {"databaseURL": st.secrets["rtdb"]["url"]})
 
 
-def get_subfolder_ids(drive):
-    if "subfolder_ids" in st.session_state:
-        return st.session_state["subfolder_ids"]
-
-    ids = {}
-    for name in SUBFOLDERS:
-        ids[name] = find_or_create_folder(drive, DXF_SHARED_FOLDER_ID, name)
-
-    st.session_state["subfolder_ids"] = ids
-    return ids
+def jobs_ref():
+    init_rtdb()
+    return db.reference(JOBS_PATH)
 
 
-def upload_file_to_folder(drive, folder_id: str, filename: str, file_obj, mime: str):
-    """Upload a file-like object to Drive.
-
-    IMPORTANT: We intentionally default to *non-resumable* multipart upload.
-    We've seen 'Redirected but the response is missing a Location: header.'
-    when using resumable uploads in some environments. Multipart is more stable
-    for files in our size range.
-    """
-    try:
-        file_obj.seek(0)
-    except Exception:
-        pass
-
-    media = MediaIoBaseUpload(file_obj, mimetype=mime, resumable=False)
-    metadata = {"name": filename, "parents": [folder_id]}
-    req = drive.files().create(body=metadata, media_body=media, fields="id,name,size,createdTime")
-    # execute with retry/backoff
-    return drive_execute(req, retries=6, base_sleep=0.8)
+# -----------------------------
+# Drive operations (minimal)
+# -----------------------------
+def drive_upload_bytes(
+    drive,
+    folder_id: str,
+    filename: str,
+    data: bytes,
+    mime: str = "application/dxf",
+) -> Dict[str, Any]:
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    body = {"name": filename, "parents": [folder_id]}
+    # NOTE: If this fails with "Service Accounts do not have storage quota",
+    # your INBOX folder is not on a Shared Drive OR the SA can't upload there.
+    return drive.files().create(body=body, media_body=media, fields="id,name,size,createdTime").execute()
 
 
-def upsert_json_file(drive, folder_id: str, filename: str, payload: dict):
-    q = (
-        f"'{folder_id}' in parents and "
-        f"name = '{filename}' and "
-        "mimeType != 'application/vnd.google-apps.folder' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name)").execute()
-    files = res.get("files", [])
-
-    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    media = MediaIoBaseUpload(BytesIO(data), mimetype="application/json", resumable=False)
-
-    if files:
-        file_id = files[0]["id"]
-        updated = drive.files().update(fileId=file_id, media_body=media).execute()
-        return updated
-    else:
-        meta = {"name": filename, "parents": [folder_id]}
-        created = drive.files().create(body=meta, media_body=media, fields="id").execute()
-        return created
-
-
-def read_json_file_by_name(drive, folder_id: str, filename: str) -> dict | None:
-    q = (
-        f"'{folder_id}' in parents and "
-        f"name = '{filename}' and "
-        "trashed = false"
-    )
-    res = drive.files().list(q=q, fields="files(id,name)").execute()
-    files = res.get("files", [])
-    if not files:
-        return None
-
-    file_id = files[0]["id"]
-    request = drive.files().get_media(fileId=file_id)
-
-    buf = BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
+def drive_download_bytes(drive, file_id: str) -> bytes:
+    req = drive.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
-        _, done = _with_retry(lambda: downloader.next_chunk(), what='META 읽기')
-
-    buf.seek(0)
-    return json.loads(buf.read().decode("utf-8"))
-
-
-def list_recent_jobs(drive, meta_folder_id: str, limit: int = 20):
-    q = f"'{meta_folder_id}' in parents and trashed=false"
-    req = drive.files().list(
-        q=q,
-        fields="files(id,name,createdTime,modifiedTime,size)",
-        orderBy="modifiedTime desc",
-        pageSize=limit,
-    )
-
-    try:
-        res = drive_execute(req, retries=5)
-    except Exception as e:
-        st.warning(
-            f"Google Drive query temporarily failed. Will retry automatically.\n"
-            f"Reason: {type(e).__name__}"
-        )
-        return []
-
-    files = res.get("files", [])
-    files = [f for f in files if f.get("name", "").lower().endswith(".json")]
-    return files
-
-
-def download_file_bytes(drive, file_id: str) -> bytes:
-    request = drive.files().get_media(fileId=file_id)
-    buf = BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = _with_retry(lambda: downloader.next_chunk(), what='META 읽기')
+        _, done = downloader.next_chunk()
     return buf.getvalue()
 
+
+# -----------------------------
+# RTDB job ops (minimal)
+# -----------------------------
+def create_job(job_id: str, original_filename: str, inbox_file_id: str) -> None:
+    payload = {
+        "job_id": job_id,
+        "status": "queued",  # queued -> working -> done|error
+        "original_filename": original_filename,
+        "inbox_file_id": inbox_file_id,
+        "outbox_file_id": None,
+        "created_at": now_seoul_iso(),
+        "updated_at": now_seoul_iso(),
+        "message": "",
+        "progress": 0,
+    }
+    jobs_ref().child(job_id).set(payload)
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    return jobs_ref().child(job_id).get()
+
+
+def list_jobs(limit: int = 30) -> List[Dict[str, Any]]:
+    data = jobs_ref().get() or {}
+    # data is dict {job_id: payload}
+    jobs = list(data.values())
+    # sort by created_at desc (string ISO, works OK)
+    jobs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return jobs[:limit]
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="centered")
+st.title(APP_TITLE)
+st.caption("Drive: INBOX 업로드 / OUTBOX 다운로드만. 잡 상태는 RTDB만 사용합니다.")
+
+# Load clients early to fail fast with clear errors
+try:
+    drive = get_drive_service()
+    folders = _get_drive_folder_ids()
+except Exception as e:
+    st.error(f"Drive 초기화 실패: {e}")
+    st.stop()
+
+try:
+    init_rtdb()
+except Exception as e:
+    st.error(f"RTDB 초기화 실패: {e}")
+    st.stop()
+
+# -----------------------------
+# Upload section
+# -----------------------------
+st.subheader("1) Upload DXF → INBOX")
+uploaded = st.file_uploader("DXF 파일 선택", type=["dxf"], accept_multiple_files=False)
+
+if uploaded:
+    size = len(uploaded.getvalue())
+    if size > MAX_FILE_BYTES:
+        st.error(f"파일이 너무 큽니다. 최대 {MAX_FILE_MB}MB까지 지원합니다.")
+    else:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("Upload & Create Job", type="primary", use_container_width=True):
+                try:
+                    raw = uploaded.getvalue()
+                    job_id = make_job_id(uploaded.name)
+                    # Use job_id as file name prefix to keep tracking easy
+                    drive_filename = f"{job_id}.dxf"
+                    created = drive_upload_bytes(drive, folders["INBOX"], drive_filename, raw, mime="application/dxf")
+                    inbox_file_id = created["id"]
+                    create_job(job_id, uploaded.name, inbox_file_id)
+                    st.success("업로드 완료 + RTDB 잡 생성 완료")
+                    st.code(f"job_id: {job_id}\ninbox_file_id: {inbox_file_id}")
+                    st.session_state["last_job_id"] = job_id
+                except HttpError as he:
+                    st.error(f"Drive 업로드 실패: {he}")
+                    st.info(
+                        "만약 에러 메시지에 'Service Accounts do not have storage quota'가 포함되면,\n"
+                        "현재 폴더가 Shared Drive가 아니거나 서비스계정 업로드가 허용되지 않는 구조입니다.\n"
+                        "이 경우 Shared Drive로 옮기는 것이 정석 해결입니다."
+                    )
+                except Exception as e:
+                    st.error(f"업로드/잡 생성 실패: {type(e).__name__}: {e}")
+
+        with col2:
+            last = st.session_state.get("last_job_id")
+            st.write("최근 생성한 job_id")
+            st.code(last or "(없음)")
+
+st.divider()
+
+# -----------------------------
+# Jobs section
+# -----------------------------
+st.subheader("2) Jobs (RTDB)")
+
+colA, colB = st.columns([1, 1])
+with colA:
+    selected_job_id = st.text_input(
+        "조회할 job_id (비워두면 목록에서 선택)",
+        value=st.session_state.get("last_job_id", ""),
+        placeholder="20260118_123456_abcd1234_file.dxf",
+    )
+with colB:
+    auto_refresh = st.checkbox("자동 새로고침(5초)", value=False)
+
+# List recent jobs
+jobs = []
+try:
+    jobs = list_jobs(limit=30)
+except Exception as e:
+    st.warning(f"잡 목록 조회 실패: {e}")
+
+if jobs:
+    # Make a simple selector
+    options = ["(선택 안 함)"] + [j.get("job_id", "(no id)") for j in jobs]
+    pick = st.selectbox("최근 잡 선택", options, index=0)
+    if pick != "(선택 안 함)":
+        selected_job_id = pick
+
+# Fetch job
+job = None
+if selected_job_id:
+    try:
+        job = get_job(selected_job_id)
+    except Exception as e:
+        st.warning(f"잡 조회 실패: {e}")
+
+if job:
+    st.write("**Job Status**")
+    st.json(job)
+
+    status = (job.get("status") or "").lower()
+    prog = int(job.get("progress") or 0)
+    st.progress(min(max(prog, 0), 100))
+
+    if status == "done":
+        out_id = job.get("outbox_file_id")
+        if out_id:
+            if st.button("Download Result DXF", use_container_width=True):
+                try:
+                    data = drive_download_bytes(drive, out_id)
+                    out_name = job.get("result_filename") or f"{selected_job_id}_translated.dxf"
+                    st.download_button(
+                        "Click to save",
+                        data=data,
+                        file_name=out_name,
+                        mime="application/dxf",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"다운로드 실패: {type(e).__name__}: {e}")
+        else:
+            st.warning("status=done 이지만 outbox_file_id가 없습니다. 워커가 RTDB 업데이트를 확인해 주세요.")
+
+    elif status == "error":
+        st.error(job.get("message") or "워커 처리 중 에러가 발생했습니다.")
+else:
+    st.info("job_id를 입력하거나 목록에서 선택하세요.")
+
+# Auto refresh loop (lightweight)
+if auto_refresh:
+    time.sleep(5)
+    st.rerun()
 
 def find_file_in_folder_by_name(drive, folder_id: str, filename: str):
     q = (
