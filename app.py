@@ -10,8 +10,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from io import BytesIO
 import re
 from datetime import datetime, timezone, timedelta
@@ -136,18 +135,26 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
-    s = st.secrets["drive_oauth"]
-    creds = Credentials(
-        token=None,
-        refresh_token=s["refresh_token"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=s["client_id"],
-        client_secret=s["client_secret"],
-        scopes=SCOPES,
-    )
-    creds.refresh(Request())
+    # 1) Streamlit Secrets에 gcp_service_account로 넣은 경우 (권장)
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        # private_key 줄바꿈 보정
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n").strip()
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
-    # Use AuthorizedHttp with timeout for better stability on Streamlit Cloud
+    # 2) 예전 방식: SERVICE_ACCOUNT_B64로 넣은 경우도 지원 (호환용)
+    elif "SERVICE_ACCOUNT_B64" in st.secrets:
+        info = load_service_account_info()
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    else:
+        raise RuntimeError(
+            "Service Account secrets not found. "
+            "Add [gcp_service_account] (recommended) or SERVICE_ACCOUNT_B64 to Streamlit Secrets."
+        )
+
+    # Streamlit Cloud에서 안정성을 위해 timeout 지정
     authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
     return build("drive", "v3", http=authed_http, cache_discovery=False)
 
