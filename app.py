@@ -464,7 +464,10 @@ with st.expander("About", expanded=False):
 # Drive connection
 try:
     drive = get_drive_service()
-    folders = get_subfolder_ids(drive)
+    folders = {
+        "INBOX": st.secrets["drive"]["DXF_INBOX_FOLDER_ID"].strip(),
+        "OUTBOX": st.secrets["drive"]["DXF_OUTBOX_FOLDER_ID"].strip(),
+    }
 except Exception as e:
     st.error("Failed to connect to Google Drive or initialize folders. Please check Secrets and folder sharing permissions.")
     st.exception(e)
